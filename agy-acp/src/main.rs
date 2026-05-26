@@ -71,35 +71,52 @@ impl Adapter {
         }
     }
 
-    /// Load persisted session store with exclusive file lock.
-    fn load_store(&self) -> SessionStore {
+    /// Acquire exclusive lock on a dedicated lock file for read-write mutual exclusion.
+    fn lock_state_file(&self) -> Option<fs::File> {
+        if let Some(parent) = self.state_file.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let lock_path = self.state_file.with_extension("lock");
+        let lock_file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&lock_path)
+            .ok()?;
+        lock_file.lock_exclusive().ok()?;
+        Some(lock_file)
+    }
+
+    /// Load persisted session store (caller must hold lock).
+    fn load_store_inner(&self) -> SessionStore {
         let Some(file) = fs::File::open(&self.state_file).ok() else {
             return SessionStore::default();
         };
-        file.lock_shared().ok();
-        let store = serde_json::from_reader(&file).unwrap_or_default();
-        file.unlock().ok();
-        store
+        serde_json::from_reader(&file).unwrap_or_default()
     }
 
-    /// Persist session store with exclusive file lock and atomic write.
+    /// Load persisted session store with lock.
+    fn load_store(&self) -> SessionStore {
+        let _lock = self.lock_state_file();
+        self.load_store_inner()
+    }
+
+    /// Persist session store with exclusive lock and atomic write.
     fn save_store(&self, store: &SessionStore) {
         if let Some(parent) = self.state_file.parent() {
             let _ = fs::create_dir_all(parent);
         }
+        let Some(_lock) = self.lock_state_file() else {
+            eprintln!("[agy-acp] WARN: failed to lock state file");
+            return;
+        };
         let tmp = self.state_file.with_extension("tmp");
         let Ok(file) = fs::File::create(&tmp) else {
             eprintln!("[agy-acp] WARN: failed to create state file");
             return;
         };
-        if file.lock_exclusive().is_err() {
-            eprintln!("[agy-acp] WARN: failed to lock state file");
-            return;
-        }
         if serde_json::to_writer_pretty(&file, store).is_ok() {
             let _ = fs::rename(&tmp, &self.state_file);
         }
-        file.unlock().ok();
     }
 
     /// Try to restore conversation_id from persisted state.
@@ -111,16 +128,24 @@ impl Adapter {
             .and_then(|s| s.conversation_id.clone())
     }
 
-    /// Persist a session binding.
+    /// Persist a session binding (read-modify-write under single lock).
     fn persist_session(&self, session_id: &str, conversation_id: Option<&str>) {
-        let mut store = self.load_store();
+        let Some(_lock) = self.lock_state_file() else {
+            return;
+        };
+        let mut store = self.load_store_inner();
         store.sessions.insert(
             session_id.to_string(),
             StoredSession {
                 conversation_id: conversation_id.map(String::from),
             },
         );
-        self.save_store(&store);
+        let tmp = self.state_file.with_extension("tmp");
+        if let Ok(file) = fs::File::create(&tmp) {
+            if serde_json::to_writer_pretty(&file, &store).is_ok() {
+                let _ = fs::rename(&tmp, &self.state_file);
+            }
+        }
     }
 
     fn conversation_snapshot(&self) -> HashSet<String> {
@@ -444,6 +469,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // filesystem I/O — run with CHI_INTEG=1
     fn test_new_conversation_id_returns_none_when_multiple_files() {
         let root = std::env::temp_dir().join(format!("agy-acp-multi-{}", Uuid::new_v4()));
         let conv_dir = root.join("conversations");
