@@ -865,38 +865,21 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    /// Download and extract auth seed from a presigned URL (AGY_AUTH_URL env var).
-    /// Returns true if auth is ready (either already present or successfully downloaded).
+    /// Check auth is available: either GEMINI_API_KEY env var or local keyring.
+    /// Returns true if auth is ready, false to skip the test.
     fn prepare_auth() -> bool {
-        use std::process::Command;
-
-        let home = std::env::var("HOME").unwrap_or_default();
-        let auth_dir = format!("{}/.gemini/antigravity-cli", home);
-        // If auth already exists locally, skip download
-        if std::path::Path::new(&auth_dir).join("settings.json").exists() {
-            eprintln!("[e2e] Auth already present at {}", auth_dir);
+        if std::env::var("GEMINI_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+            eprintln!("[e2e] Using GEMINI_API_KEY");
             return true;
         }
-        let url = match std::env::var("AGY_AUTH_URL") {
-            Ok(u) if !u.is_empty() => u,
-            _ => {
-                eprintln!("SKIP: AGY_AUTH_URL not set and no local auth found");
-                return false;
-            }
-        };
-        eprintln!("[e2e] Downloading auth seed from presigned URL...");
-        let status = Command::new("curl")
-            .args(["-fsSL", "-o", "/tmp/agy-auth.tar.gz", &url])
-            .status();
-        if status.map(|s| !s.success()).unwrap_or(true) {
-            eprintln!("SKIP: Failed to download auth seed (URL expired?)");
-            return false;
+        let home = std::env::var("HOME").unwrap_or_default();
+        let settings = format!("{}/.gemini/antigravity-cli/settings.json", home);
+        if std::path::Path::new(&settings).exists() {
+            eprintln!("[e2e] Using local auth (keyring)");
+            return true;
         }
-        let status = Command::new("tar")
-            .args(["-xzf", "/tmp/agy-auth.tar.gz", "-C", &home])
-            .status();
-        let _ = std::fs::remove_file("/tmp/agy-auth.tar.gz");
-        status.map(|s| s.success()).unwrap_or(false)
+        eprintln!("SKIP: No GEMINI_API_KEY and no local auth found");
+        false
     }
 
     /// E2E test: spawns agy-acp, sends initialize → session/new → session/prompt,

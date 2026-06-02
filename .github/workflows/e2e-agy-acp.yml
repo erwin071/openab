@@ -45,14 +45,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
-      - name: Prepare auth seed
-        run: |
-          curl -fsSL -o /tmp/agy-auth.tar.gz "$AGY_AUTH_URL"
-          tar -xzf /tmp/agy-auth.tar.gz -C "$HOME"
-          rm -f /tmp/agy-auth.tar.gz
-        env:
-          AGY_AUTH_URL: ${{ secrets.AGY_AUTH_URL }}
-
       - name: Run E2E test
         working-directory: agy-acp
         run: cargo test e2e -- --ignored --nocapture
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
