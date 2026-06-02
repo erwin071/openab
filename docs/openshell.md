@@ -17,6 +17,52 @@ curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | 
 > # Log out and back in (or: loginctl terminate-user $USER)
 > ```
 
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  Host (Linux with Docker)                                           │
+│                                                                     │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │  OpenShell Gateway (systemd user service :17670)              │  │
+│  │  • manages sandbox lifecycle                                  │  │
+│  │  • enforces network policy (default-deny egress)              │  │
+│  │  • injects provider credentials into sandbox env              │  │
+│  └──────────────────────────┬────────────────────────────────────┘  │
+│                             │ creates & policies                     │
+│                             ▼                                        │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │  Docker Container (sandbox: "oab")                            │  │
+│  │                                                               │  │
+│  │  /sandbox/                                                    │  │
+│  │  ├── openab              ← ACP broker binary                  │  │
+│  │  ├── openab-agent        ← native Rust coding agent           │  │
+│  │  ├── config.toml         ← bot token + agent config           │  │
+│  │  └── .openab/agent/auth.json  ← codex OAuth token             │  │
+│  │                                                               │  │
+│  │  openab run ──stdio JSON-RPC──► openab-agent                  │  │
+│  │       │                              │                        │  │
+│  │       │ Discord WS                   │ ChatGPT API            │  │
+│  └───────┼──────────────────────────────┼────────────────────────┘  │
+│           │                              │                           │
+│  ┌────────┼──────────────────────────────┼────────────────────┐     │
+│  │ Network Policy (egress allowlist)     │                    │     │
+│  │  ✓ discord.com:443                    │                    │     │
+│  │  ✓ gateway.discord.gg:443            │                    │     │
+│  │  ✓ cdn.discordapp.com:443            │                    │     │
+│  │  ✓ chatgpt.com:443  ◄────────────────┘                    │     │
+│  │  ✓ auth0.openai.com:443                                   │     │
+│  │  ✗ everything else DENIED                                  │     │
+│  └────────┼───────────────────────────────────────────────────┘     │
+└───────────┼─────────────────────────────────────────────────────────┘
+            │
+            ▼
+┌──────────────────┐         ┌──────────────────┐
+│  Discord API     │         │  ChatGPT API     │
+│  (bot gateway)   │         │  (chatgpt.com)   │
+└──────────────────┘         └──────────────────┘
+```
+
 ## Quick Start (Local Docker)
 
 All commands run **on the host** unless prefixed with `sandbox$`.
