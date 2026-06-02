@@ -207,6 +207,8 @@ jobs:
           - { suffix: "-grok" }
           - { suffix: "-antigravity" }
           - { suffix: "-pi" }
+          - { suffix: "-native" }
+          - { suffix: "-native-sandbox" }
     runs-on: ubuntu-latest
     permissions:
       contents: read
