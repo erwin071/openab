@@ -89,6 +89,10 @@ impl AcpServer {
                     // TODO(v0.2): implement cancellation token to abort in-progress agent.run()
                     vec![self.ok_response(id, json!({}))]
                 }
+                Some("session/set_config_option") => {
+                    let params = req.params.unwrap_or(json!({}));
+                    vec![self.handle_set_config_option(id, &params)]
+                }
                 Some(method) => {
                     vec![self.error_response(id, -32601, &format!("method not found: {method}"))]
                 }
@@ -127,42 +131,80 @@ impl AcpServer {
 
         // Respect OPENAB_AGENT_PROVIDER if set, otherwise auto-detect
         let provider_choice = std::env::var("OPENAB_AGENT_PROVIDER").unwrap_or_default();
-        let provider: Box<dyn crate::llm::LlmProvider> = match provider_choice.as_str() {
-            "anthropic" => match AnthropicProvider::from_env() {
-                Ok(p) => Box::new(p),
-                Err(e) => return self.error_response(id, -32000, &e),
-            },
-            "openai" | "codex" => match crate::llm::OpenAiProvider::from_auth_store() {
-                Ok(p) => Box::new(p),
-                Err(e) => return self.error_response(id, -32000, &e),
-            },
-            _ => {
-                // Auto-detect: try API key first, then OAuth token
-                match AnthropicProvider::from_env() {
-                    Ok(p) => Box::new(p),
-                    Err(_) => match crate::llm::OpenAiProvider::from_auth_store() {
-                        Ok(p) => Box::new(p),
-                        Err(e) => {
-                            return self.error_response(
-                                id,
-                                -32000,
-                                &format!("No credentials: set ANTHROPIC_API_KEY or run `openab-agent auth codex-oauth`. {e}"),
-                            )
-                        }
-                    },
+        let (provider, active_provider): (Box<dyn crate::llm::LlmProvider>, &str) =
+            match provider_choice.as_str() {
+                "anthropic" => match AnthropicProvider::from_env() {
+                    Ok(p) => (Box::new(p), "anthropic"),
+                    Err(e) => return self.error_response(id, -32000, &e),
+                },
+                "openai" | "codex" => match crate::llm::OpenAiProvider::from_auth_store() {
+                    Ok(p) => (Box::new(p), "openai"),
+                    Err(e) => return self.error_response(id, -32000, &e),
+                },
+                _ => {
+                    // Auto-detect: try API key first, then OAuth token
+                    match AnthropicProvider::from_env() {
+                        Ok(p) => (Box::new(p), "anthropic"),
+                        Err(_) => match crate::llm::OpenAiProvider::from_auth_store() {
+                            Ok(p) => (Box::new(p), "openai"),
+                            Err(e) => {
+                                return self.error_response(
+                                    id,
+                                    -32000,
+                                    &format!("No credentials: set ANTHROPIC_API_KEY or run `openab-agent auth codex-oauth`. {e}"),
+                                )
+                            }
+                        },
+                    }
                 }
-            }
-        };
+            };
 
         let agent = Agent::new_boxed(provider, self.working_dir.clone());
         self.sessions.insert(session_id.clone(), agent);
+
+        let model_name = std::env::var("OPENAB_AGENT_MODEL").unwrap_or_else(|_| {
+            if active_provider == "anthropic" {
+                "claude-sonnet-4-20250514".to_string()
+            } else {
+                "gpt-4.1-nano".to_string()
+            }
+        });
+
         let resp = JsonRpcResponse {
             jsonrpc: "2.0",
             id,
-            result: Some(json!({ "sessionId": session_id })),
+            result: Some(json!({
+                "sessionId": session_id,
+                "configOptions": [{
+                    "id": "model",
+                    "name": "Model",
+                    "category": "model",
+                    "type": "enum",
+                    "currentValue": model_name,
+                    "options": Self::available_models()
+                }]
+            })),
             error: None,
         };
         serde_json::to_string(&resp).unwrap()
+    }
+
+    /// List available models based on configured credentials.
+    fn available_models() -> Vec<Value> {
+        let mut models = Vec::new();
+        if std::env::var("ANTHROPIC_API_KEY").is_ok() {
+            models.push(json!({"value": "claude-sonnet-4-20250514", "name": "Claude Sonnet 4"}));
+            models.push(json!({"value": "claude-haiku-4-20250514", "name": "Claude Haiku 4"}));
+        }
+        if crate::auth::load_tokens().is_ok() {
+            models.push(json!({"value": "gpt-4.1-nano", "name": "GPT-4.1 Nano"}));
+            models.push(json!({"value": "gpt-4.1-mini", "name": "GPT-4.1 Mini"}));
+            models.push(json!({"value": "o4-mini", "name": "o4-mini"}));
+        }
+        if models.is_empty() {
+            models.push(json!({"value": "none", "name": "No credentials configured"}));
+        }
+        models
     }
 
     async fn handle_session_prompt(&mut self, id: u64, params: &Value) -> Vec<String> {
@@ -221,6 +263,41 @@ impl AcpServer {
         output_lines
     }
 
+    fn handle_set_config_option(&mut self, id: u64, params: &Value) -> String {
+        let config_id = params.get("configId").and_then(|v| v.as_str()).unwrap_or("");
+        let value = params.get("value").and_then(|v| v.as_str()).unwrap_or("");
+
+        if config_id != "model" || value.is_empty() {
+            return self.error_response(id, -32602, "unsupported configId or empty value");
+        }
+
+        // Set the model env var so next session picks it up
+        // SAFETY: openab-agent is single-threaded for config changes
+        unsafe { std::env::set_var("OPENAB_AGENT_MODEL", value) };
+
+        // Determine provider from model name
+        let provider = if value.starts_with("claude") {
+            "anthropic"
+        } else {
+            "openai"
+        };
+        unsafe { std::env::set_var("OPENAB_AGENT_PROVIDER", provider) };
+
+        self.ok_response(
+            id,
+            json!({
+                "configOptions": [{
+                    "id": "model",
+                    "name": "Model",
+                    "category": "model",
+                    "type": "enum",
+                    "currentValue": value,
+                    "options": Self::available_models()
+                }]
+            }),
+        )
+    }
+
     fn ok_response(&self, id: u64, result: Value) -> String {
         serde_json::to_string(&JsonRpcResponse {
             jsonrpc: "2.0",
@@ -267,6 +344,12 @@ mod tests {
         assert_eq!(resp["jsonrpc"], "2.0");
         assert_eq!(resp["id"], 2);
         assert!(resp["result"]["sessionId"].as_str().unwrap().len() > 0);
+        // Verify configOptions are returned for /models support
+        let config_options = resp["result"]["configOptions"].as_array().unwrap();
+        assert!(!config_options.is_empty());
+        assert_eq!(config_options[0]["id"], "model");
+        assert_eq!(config_options[0]["category"], "model");
+        assert!(!config_options[0]["options"].as_array().unwrap().is_empty());
     }
 
     #[test]
