@@ -62,7 +62,3 @@ gh secret set GEMINI_API_KEY --repo openabdev/openab
 ```
 
 Get a free key from https://aistudio.google.com/apikey — the e2e sends one short prompt per run so cost is negligible.
-
-## Publishing auth seed (deprecated)
-
-The `scripts/publish-auth-seed.sh` script was for the OAuth tarball approach. It's no longer needed since we use `GEMINI_API_KEY` directly.
