@@ -34,6 +34,7 @@ HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD pgrep -x openab || exit 1
 ENV OPENAB_AGENT_COMMAND=gemini
 ENV OPENAB_AGENT_WORKING_DIR=/home/node
+ENV OPENAB_AGENT_AUTH_COMMAND="gemini auth"
 
 ENTRYPOINT ["tini", "--"]
 CMD ["openab", "run", "-c", "/etc/openab/config.toml"]

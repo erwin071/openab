@@ -42,6 +42,7 @@ HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD pgrep -x openab || exit 1
 ENV OPENAB_AGENT_COMMAND=openab-agent
 ENV OPENAB_AGENT_WORKING_DIR=/home/agent
+ENV OPENAB_AGENT_AUTH_COMMAND="openab-agent auth codex-oauth"
 
 ENTRYPOINT ["tini", "--"]
 CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
