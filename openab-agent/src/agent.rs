@@ -53,6 +53,11 @@ impl Agent {
         }
     }
 
+    /// Replace the LLM provider while preserving conversation history.
+    pub fn swap_provider(&mut self, provider: Box<dyn LlmProvider>) {
+        self.provider = provider;
+    }
+
     /// Run the agent with a user prompt, executing tool calls until completion.
     /// Returns the final text response.
     fn build_system_prompt(working_dir: &str) -> String {

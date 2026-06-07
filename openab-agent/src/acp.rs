@@ -486,10 +486,6 @@ impl AcpServer {
         };
         let provider_name = matched.provider.as_str();
 
-        // Store in struct (safe — no env mutation)
-        self.active_model = Some(value.to_string());
-        self.active_provider = Some(matched.provider.clone());
-
         // Rebuild the current session's provider so the switch takes effect immediately
         if !session_id.is_empty() && self.sessions.contains_key(session_id) {
             let new_provider: Result<Box<dyn crate::llm::LlmProvider>, String> = match provider_name
@@ -502,10 +498,8 @@ impl AcpServer {
             };
             match new_provider {
                 Ok(p) => {
-                    // Atomic: only remove old session after new provider succeeds
-                    self.sessions.remove(session_id);
-                    let agent = Agent::new_boxed(p, self.working_dir.clone());
-                    self.sessions.insert(session_id.to_string(), agent);
+                    // Swap provider in-place, preserving conversation history
+                    self.sessions.get_mut(session_id).unwrap().swap_provider(p);
                 }
                 Err(e) => {
                     return self.error_response(
@@ -516,6 +510,10 @@ impl AcpServer {
                 }
             }
         }
+
+        // Update state only after successful rebuild (avoids stale state on failure)
+        self.active_model = Some(value.to_string());
+        self.active_provider = Some(matched.provider.clone());
 
         self.ok_response(
             id,
