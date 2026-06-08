@@ -768,12 +768,6 @@ fn expand_env_vars(raw: &str) -> String {
     .into_owned()
 }
 
-pub fn load_config(path: &Path) -> anyhow::Result<Config> {
-    let raw = std::fs::read_to_string(path)
-        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
-    parse_config(&raw, path.display().to_string().as_str())
-}
-
 /// Load raw config text from a file path (env vars expanded but secrets NOT resolved).
 pub fn load_config_raw(path: &Path) -> anyhow::Result<String> {
     let raw = std::fs::read_to_string(path)
@@ -816,7 +810,21 @@ pub fn parse_config_str(expanded: &str, source: &str) -> anyhow::Result<Config> 
     parse_config_inner(expanded, source)
 }
 
-pub async fn load_config_from_url(url: &str) -> anyhow::Result<Config> {
+#[cfg(test)]
+fn parse_config(raw: &str, source: &str) -> anyhow::Result<Config> {
+    let expanded = expand_env_vars(raw);
+    parse_config_inner(&expanded, source)
+}
+
+#[cfg(test)]
+fn load_config(path: &Path) -> anyhow::Result<Config> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
+    parse_config(&raw, path.display().to_string().as_str())
+}
+
+#[cfg(test)]
+async fn load_config_from_url(url: &str) -> anyhow::Result<Config> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
@@ -833,21 +841,9 @@ pub async fn load_config_from_url(url: &str) -> anyhow::Result<Config> {
         .bytes()
         .await
         .map_err(|e| anyhow::anyhow!("failed to read response body from {url}: {e}"))?;
-    const MAX_CONFIG_BYTES: usize = 1024 * 1024; // 1 MiB
-    if bytes.len() > MAX_CONFIG_BYTES {
-        anyhow::bail!(
-            "remote config from {url} exceeds 1 MiB limit ({} bytes)",
-            bytes.len()
-        );
-    }
     let raw = String::from_utf8(bytes.to_vec())
         .map_err(|e| anyhow::anyhow!("remote config from {url} is not valid UTF-8: {e}"))?;
     parse_config(&raw, url)
-}
-
-fn parse_config(raw: &str, source: &str) -> anyhow::Result<Config> {
-    let expanded = expand_env_vars(raw);
-    parse_config_inner(&expanded, source)
 }
 
 fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {

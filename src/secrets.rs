@@ -52,7 +52,7 @@ async fn resolve_aws_sm(key: &str, uri: &str, cfg: &SecretsConfig) -> anyhow::Re
     let (secret_id, json_key) = parse_aws_sm_uri(uri)
         .ok_or_else(|| anyhow::anyhow!("secret '{key}': invalid aws-sm:// URI '{uri}' — expected aws-sm://<secret-id>#<json-key>"))?;
 
-    let mut config_loader = aws_config::from_env();
+    let mut config_loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
     if let Some(ref region) = cfg.aws.region {
         config_loader = config_loader.region(aws_config::Region::new(region.clone()));
     }
