@@ -195,7 +195,6 @@ Run any coding agent remotely on [Amazon Bedrock AgentCore](https://docs.aws.ama
 ```toml
 [agentcore]
 runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-agent"
-region = "us-east-1"
 ```
 
 Smaller image (~50MB), persistent filesystem, isolated microVMs, pay-per-use. See [docs/agentcore.md](docs/agentcore.md) for full setup.

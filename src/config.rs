@@ -69,12 +69,26 @@ impl<'de> Deserialize<'de> for AllowBots {
 pub struct AgentCoreConfig {
     /// AgentCore Runtime ARN (required)
     pub runtime_arn: String,
-    /// AWS region (default: us-east-1)
-    #[serde(default = "default_agentcore_region")]
-    pub region: String,
+    /// AWS region. If omitted, extracted from runtime_arn automatically.
+    pub region: Option<String>,
     /// Cancel strategy: "noop" or "stop" (default: stop)
     #[serde(default = "default_agentcore_cancel_strategy")]
     pub cancel_strategy: AgentCoreCancelStrategy,
+}
+
+impl AgentCoreConfig {
+    /// Resolve region: explicit > extracted from ARN > fallback us-east-1
+    pub fn resolved_region(&self) -> String {
+        if let Some(ref r) = self.region {
+            return r.clone();
+        }
+        // ARN format: arn:aws:bedrock-agentcore:REGION:ACCOUNT:runtime/ID
+        let parts: Vec<&str> = self.runtime_arn.split(':').collect();
+        if parts.len() >= 4 && !parts[3].is_empty() {
+            return parts[3].to_string();
+        }
+        "us-east-1".into()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -104,9 +118,6 @@ impl std::fmt::Display for AgentCoreCancelStrategy {
     }
 }
 
-fn default_agentcore_region() -> String {
-    "us-east-1".into()
-}
 fn default_agentcore_cancel_strategy() -> AgentCoreCancelStrategy {
     AgentCoreCancelStrategy::Stop
 }
@@ -921,7 +932,7 @@ fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
                     "--runtime-arn".into(),
                     ac.runtime_arn.clone(),
                     "--region".into(),
-                    ac.region.clone(),
+                    ac.resolved_region(),
                     "--cancel-strategy".into(),
                     ac.cancel_strategy.to_string(),
                 ],
@@ -1354,7 +1365,7 @@ runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/test"
 "#;
         let cfg = parse_config(toml, "test").unwrap();
         let ac = cfg.agentcore.unwrap();
-        assert_eq!(ac.region, "us-east-1");
+        assert_eq!(ac.resolved_region(), "us-east-1");
         assert_eq!(ac.cancel_strategy, AgentCoreCancelStrategy::Stop);
     }
 }

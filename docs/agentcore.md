@@ -19,7 +19,6 @@ bot_token = "${DISCORD_BOT_TOKEN}"
 
 [agentcore]
 runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-kiro-agent"
-region = "us-east-1"
 ```
 
 That's it. OAB auto-spawns the bundled `agentcore-acp` adapter.
@@ -35,14 +34,14 @@ That's it. OAB auto-spawns the bundled `agentcore-acp` adapter.
 ```toml
 [agentcore]
 runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-agent"  # required
-region = "us-east-1"           # default: us-east-1
+# region = "us-east-1"        # optional — auto-extracted from ARN
 cancel_strategy = "stop"       # "stop" (default) or "noop"
 ```
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
 | `runtime_arn` | yes | — | AgentCore Runtime ARN |
-| `region` | no | `us-east-1` | AWS region |
+| `region` | no | extracted from ARN | Override AWS region (rarely needed) |
 | `cancel_strategy` | no | `stop` | What to do on cancel: `stop` terminates the session, `noop` ignores |
 
 If you need full control, use `[agent]` directly:
