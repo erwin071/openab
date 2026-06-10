@@ -1,0 +1,38 @@
+# Dockerfile.agentcore — OAB + agentcore-acp only (no bundled coding CLI).
+# The coding agent (Kiro, Claude, Codex, etc.) runs remotely in AgentCore Runtime.
+# Result: ~50MB image vs ~500MB+ with a full coding CLI baked in.
+
+# --- Build stage ---
+FROM rust:1-bookworm AS builder
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release && rm -rf src
+COPY src/ src/
+RUN touch src/main.rs && cargo build --release
+
+# --- Runtime stage ---
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates python3 python3-pip tini \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install uv (for running agentcore-acp without pip install)
+RUN curl -fsSL https://astral.sh/uv/install.sh | sh || \
+    pip3 install --no-cache-dir uv
+
+RUN useradd -m -s /bin/bash -u 1000 agent
+ENV HOME=/home/agent
+WORKDIR /home/agent
+
+COPY --from=builder --chown=agent:agent /build/target/release/openab /usr/local/bin/openab
+COPY --chown=agent:agent agentcore-acp/agentcore_acp.py /opt/agentcore-acp/agentcore_acp.py
+
+USER agent
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD pgrep -x openab || exit 1
+
+# No OPENAB_AGENT_COMMAND — [agentcore] in config.toml handles it,
+# or set via env: OPENAB_AGENT_COMMAND="uv run --script /opt/agentcore-acp/agentcore_acp.py --runtime-arn ... --region ..."
+
+ENTRYPOINT ["tini", "--"]
+CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
