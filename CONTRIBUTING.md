@@ -10,7 +10,7 @@ Every PR must address the following in its description. The [PR template](/.gith
 
 ### 0. Discord Discussion URL
 
-We strongly recommend including a Discord Discussion URL in the PR body (e.g. `https://discord.com/channels/...`). Discussing your idea in Discord before opening a PR helps align on direction and avoids wasted effort. If no Discord discussion exists, explain the context directly in the PR description.
+All PRs **must** include a Discord Discussion URL in the PR body (e.g. `https://discord.com/channels/...`). Discussing your idea in Discord before opening a PR helps align on direction and avoids wasted effort. PRs without a Discord Discussion URL will be **automatically closed in 24 hours**.
 
 ### 1. What problem does this solve?
 
@@ -147,7 +147,7 @@ Every PR follows a label-driven lifecycle that keeps the review loop moving.
 ### Key Rules
 
 - **`pending-contributor`** — the ball is on the contributor; maintainers are waiting for updates.
-- **`closing-soon`** — warning that the PR will be auto-closed if no response within 3 days.
+- **`closing-soon`** — warning that the PR will be auto-closed if no response within 3 days. For PRs missing a Discord Discussion URL, auto-close happens in 24 hours.
 - **Author comment always resets** — any comment by the PR author removes `pending-contributor` and `closing-soon`, flipping the PR back to `pending-maintainer`.
 - **Re-check may re-apply `closing-soon`** — after the flip, automated checks still run. If blockers remain (e.g., missing Discord URL, CI failure, `needs-rebase`), `closing-soon` will be re-applied immediately, keeping the ball on the contributor.
-- **Immediate `closing-soon`** — in some cases (e.g., missing Discord Discussion URL), `closing-soon` is applied immediately without waiting for the stale period.
+- **Immediate `closing-soon`** — in some cases (e.g., missing Discord Discussion URL), `closing-soon` is applied immediately without waiting for the stale period. Auto-close follows in 24 hours.
