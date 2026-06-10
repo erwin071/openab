@@ -1387,4 +1387,72 @@ runtime_arn = "not-a-valid-arn"
         let err = parse_config(toml, "test").unwrap_err();
         assert!(err.to_string().contains("not a valid AgentCore Runtime ARN"));
     }
+
+    #[test]
+    fn agentcore_rejects_arn_wrong_service() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[agentcore]
+runtime_arn = "arn:aws:s3:us-east-1:123456789012:bucket/my-bucket"
+"#;
+        let err = parse_config(toml, "test").unwrap_err();
+        assert!(err.to_string().contains("not a valid AgentCore Runtime ARN"));
+    }
+
+    #[test]
+    fn agentcore_rejects_arn_missing_runtime_prefix() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[agentcore]
+runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:agent/my-agent"
+"#;
+        let err = parse_config(toml, "test").unwrap_err();
+        assert!(err.to_string().contains("not a valid AgentCore Runtime ARN"));
+    }
+
+    #[test]
+    fn agentcore_rejects_invalid_cancel_strategy() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[agentcore]
+runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/test"
+cancel_strategy = "stopp"
+"#;
+        let err = parse_config(toml, "test").unwrap_err();
+        assert!(err.to_string().contains("unknown variant"));
+    }
+
+    #[test]
+    fn agentcore_extracts_region_from_arn() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[agentcore]
+runtime_arn = "arn:aws:bedrock-agentcore:ap-northeast-1:123456789012:runtime/tokyo-agent"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert!(cfg.agent.args.contains(&"ap-northeast-1".to_string()));
+    }
+
+    #[test]
+    fn agentcore_cancel_strategy_noop() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[agentcore]
+runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/test"
+cancel_strategy = "noop"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        let ac = cfg.agentcore.unwrap();
+        assert_eq!(ac.cancel_strategy, AgentCoreCancelStrategy::Noop);
+    }
 }
