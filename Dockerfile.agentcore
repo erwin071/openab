@@ -1,37 +1,27 @@
-# Dockerfile.agentcore — OAB + agentcore-acp only (no bundled coding CLI).
+# Dockerfile.agentcore — OAB + native AgentCore bridge (no bundled coding CLI).
 # The coding agent (Kiro, Claude, Codex, etc.) runs remotely in AgentCore Runtime.
-# Result: ~50MB image vs ~500MB+ with a full coding CLI baked in.
+# Result: ~20MB image — single Rust binary, no Python/pip needed.
 
 # --- Build stage ---
 FROM rust:1-bookworm AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release && rm -rf src
+RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release --features agentcore && rm -rf src
 COPY src/ src/
-RUN touch src/main.rs && cargo build --release
+RUN touch src/main.rs && cargo build --release --features agentcore
 
 # --- Runtime stage ---
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl python3 python3-pip tini \
+      ca-certificates tini \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd -m -s /bin/bash -u 1000 agent
 
-# Install uv for the agent user
-USER agent
-RUN curl -fsSL https://astral.sh/uv/install.sh | sh
-USER root
-
-# Install boto3 system-wide (adapter imports it at module level)
-RUN pip3 install --no-cache-dir --break-system-packages boto3>=1.42
-
 ENV HOME=/home/agent
-ENV PATH="/home/agent/.local/bin:${PATH}"
 WORKDIR /home/agent
 
 COPY --from=builder --chown=agent:agent /build/target/release/openab /usr/local/bin/openab
-COPY --chown=agent:agent agentcore/acp/agentcore_acp.py /opt/agentcore/acp/agentcore_acp.py
 
 USER agent
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \

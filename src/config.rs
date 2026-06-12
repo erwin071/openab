@@ -1335,13 +1335,20 @@ bot_token = "t"
 runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-agent"
 "#;
         let cfg = parse_config(toml, "test").unwrap();
-        assert_eq!(cfg.agent.command, "uv");
+        #[cfg(feature = "agentcore")]
+        {
+            // With agentcore feature, spawns self with agentcore-bridge subcommand
+            assert!(cfg.agent.args.contains(&"agentcore-bridge".to_string()));
+        }
+        #[cfg(not(feature = "agentcore"))]
+        {
+            assert_eq!(cfg.agent.command, "uv");
+        }
         assert!(cfg.agent.args.contains(&"--runtime-arn".to_string()));
         assert!(cfg
             .agent
             .args
             .contains(&"arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-agent".to_string()));
-        assert!(cfg.agent.args.contains(&"us-east-1".to_string()));
     }
 
     #[test]

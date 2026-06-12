@@ -21,13 +21,13 @@ bot_token = "${DISCORD_BOT_TOKEN}"
 runtime_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-kiro-agent"
 ```
 
-That's it. OAB auto-spawns the bundled `agentcore-acp` adapter.
+That's it. OAB auto-spawns the native AgentCore bridge.
 
 ## Prerequisites
 
 1. **An AgentCore Runtime** with your coding agent deployed (see [Deploying a Kiro Runtime](#deploying-a-kiro-runtime) below)
-2. **AWS credentials** on the OAB pod with `bedrock-agentcore:InvokeAgentRuntime` permission
-3. **`uv`** installed (for running the adapter script)
+2. **AWS credentials** on the OAB pod with `bedrock-agentcore:InvokeAgentRuntimeCommandShell` permission
+3. **Runtime deployed after June 5, 2026** (interactive shells support required)
 
 ## Config Reference
 
@@ -46,8 +46,8 @@ If you need full control, use `[agent]` directly:
 
 ```toml
 [agent]
-command = "uv"
-args = ["run", "--script", "/opt/agentcore/acp/agentcore_acp.py", "--runtime-arn", "arn:aws:...", "--region", "us-east-1"]
+command = "openab"
+args = ["agentcore-bridge", "--runtime-arn", "arn:aws:...", "--region", "us-east-1"]
 ```
 
 ### Priority rules
@@ -58,7 +58,7 @@ args = ["run", "--script", "/opt/agentcore/acp/agentcore_acp.py", "--runtime-arn
 
 ## Docker Image
 
-Use `ghcr.io/openabdev/openab-agentcore` — a minimal image (~50MB) with only OAB + the adapter. No coding CLI bundled.
+Use `ghcr.io/openabdev/openab-agentcore` — a minimal image (~20MB) with only the OAB binary. No Python, no coding CLI bundled.
 
 ```bash
 docker pull ghcr.io/openabdev/openab-agentcore:latest
@@ -124,20 +124,21 @@ The runtime fetches the key at boot — no plaintext secrets in env vars or conf
 ## How It Works
 
 ```
-┌─────────┐       ┌─────────┐  ACP   ┌───────────────┐  SDK    ┌─────────────────────┐
-│ Discord │──────▶│   OAB   │───────▶│ agentcore-acp │──────▶  │  AgentCore Runtime  │
-│  Slack  │       │         │ stdio  │  (Python)     │         │  (Firecracker μVM)  │
-└─────────┘       └─────────┘        └───────────────┘         │  ┌───────────────┐  │
-                                                               │  │ Kiro/Claude/… │  │
-                                                               │  └───────────────┘  │
-                                                               └─────────────────────┘
+┌─────────┐       ┌─────────┐  ACP   ┌───────────────────┐  WebSocket  ┌─────────────────────┐
+│ Discord │──────▶│   OAB   │───────▶│ agentcore-bridge  │────────────▶│  AgentCore Runtime  │
+│  Slack  │       │         │ stdio  │  (Rust, in-tree)  │  (PTY/WS)  │  (Firecracker μVM)  │
+└─────────┘       └─────────┘        └───────────────────┘            │  ┌───────────────┐  │
+                                                                      │  │ kiro-cli acp  │  │
+                                                                      │  │ (long-lived)  │  │
+                                                                      │  └───────────────┘  │
+                                                                      └─────────────────────┘
 ```
 
-1. OAB spawns `agentcore-acp` as a subprocess (same as kiro-cli or claude-agent-acp)
-2. On each message, adapter calls `invoke_agent_runtime` with the prompt
-3. AgentCore routes to the microVM, runs the coding agent, streams response
-4. Adapter translates the response back to ACP notifications on stdout
-5. OAB renders in Discord/Slack/Telegram as usual
+1. OAB spawns `openab agentcore-bridge` as a subprocess (ACP stdio protocol)
+2. Bridge opens a SigV4-signed WebSocket to AgentCore (`InvokeAgentRuntimeCommandShell`)
+3. Inside the persistent PTY shell, `kiro-cli acp --trust-all-tools` runs as a long-lived process
+4. JSON-RPC messages flow bidirectionally: OAB ↔ bridge ↔ WebSocket ↔ kiro-cli
+5. Same `shell_id` per thread ensures session continuity across messages
 
 ## Session Memory
 
@@ -154,7 +155,7 @@ Minimum permissions for the OAB pod:
 ```json
 {
   "Effect": "Allow",
-  "Action": ["bedrock-agentcore:InvokeAgentRuntime"],
+  "Action": ["bedrock-agentcore:InvokeAgentRuntimeCommandShell"],
   "Resource": ["arn:aws:bedrock-agentcore:us-east-1:<ACCOUNT>:runtime/*"]
 }
 ```
