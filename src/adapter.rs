@@ -915,6 +915,25 @@ impl AdapterRouter {
                                     tracing::warn!(error = ?e, "delete placeholder failed; placeholder will remain visible");
                                 }
                             }
+                        } else if adapter.platform() == "discord"
+                            && contains_bot_mention(&final_content)
+                        {
+                            // Discord-specific: bot mention detected. Delete placeholder
+                            // and send as new message so Discord emits MESSAGE_CREATE —
+                            // otherwise the mentioned bot won't receive the gateway
+                            // event since MESSAGE_UPDATE skips notifications (#1110).
+                            let mut send_ok = false;
+                            if let Some(first) = chunks.first() {
+                                if adapter.send_message(&thread_channel, first).await.is_ok() {
+                                    send_ok = true;
+                                }
+                            }
+                            for chunk in chunks.iter().skip(1) {
+                                let _ = adapter.send_message(&thread_channel, chunk).await;
+                            }
+                            if send_ok {
+                                let _ = adapter.delete_message(&msg).await;
+                            }
                         } else {
                             // Normal streaming: edit first chunk into placeholder, send rest
                             if let Some(first) = chunks.first() {
@@ -951,6 +970,38 @@ impl AdapterRouter {
             })
             .await
     }
+}
+
+/// Returns true if `content` contains a Discord user/bot mention (`<@123>`, `<@!123>`)
+/// or a role mention (`<@&123>`).
+/// Used to detect cross-bot mentions so the streaming path can switch from
+/// edit (MESSAGE_UPDATE, no mention notification) to delete+send (MESSAGE_CREATE).
+fn contains_bot_mention(content: &str) -> bool {
+    let mut i = 0;
+    let bytes = content.as_bytes();
+    while i + 2 < bytes.len() {
+        if bytes[i] == b'<' && bytes[i + 1] == b'@' {
+            // Skip optional '!' (nickname mention) or '&' (role mention)
+            let start = if i + 2 < bytes.len()
+                && (bytes[i + 2] == b'!' || bytes[i + 2] == b'&')
+            {
+                i + 3
+            } else {
+                i + 2
+            };
+            if start < bytes.len() && bytes[start].is_ascii_digit() {
+                if let Some(end) = content[start..].find('>') {
+                    if content[start..start + end].chars().all(|c| c.is_ascii_digit()) {
+                        return true;
+                    }
+                }
+            }
+            i = start;
+        } else {
+            i += 1;
+        }
+    }
+    false
 }
 
 /// Flatten a tool-call title into a single line safe for inline-code spans.
@@ -1258,6 +1309,34 @@ mod tests {
         )];
         let out = compose_display(&tools, "response text", false, ToolDisplay::None);
         assert_eq!(out, "response text");
+    }
+
+    #[test]
+    fn contains_bot_mention_user() {
+        assert!(contains_bot_mention("hello <@1234567890> world"));
+    }
+
+    #[test]
+    fn contains_bot_mention_nickname() {
+        assert!(contains_bot_mention("hey <@!9876543210>"));
+    }
+
+    #[test]
+    fn contains_bot_mention_role() {
+        assert!(contains_bot_mention("calling <@&1496247626675257384>"));
+    }
+
+    #[test]
+    fn contains_bot_mention_no_match() {
+        assert!(!contains_bot_mention("hello world"));
+        assert!(!contains_bot_mention("email user@example.com"));
+        assert!(!contains_bot_mention("<@not_a_number>"));
+        assert!(!contains_bot_mention("<#123456>")); // channel mention
+    }
+
+    #[test]
+    fn contains_bot_mention_embedded() {
+        assert!(contains_bot_mention("請問 <@1501788608439386172> 1+1=?"));
     }
 }
 
