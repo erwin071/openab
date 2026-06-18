@@ -610,7 +610,7 @@ impl AdapterRouter {
                     const NATIVE_FLUSH_MS: u128 = 400;
 
                     // Streaming edit: send placeholder, spawn edit loop
-                    let (buf_tx, placeholder_msg) = if streaming && !native {
+                    let (buf_tx, placeholder_msg, edit_handle) = if streaming && !native {
                         let initial = if reset {
                             "⚠️ _Session expired, starting fresh..._\n\n…".to_string()
                         } else {
@@ -630,8 +630,15 @@ impl AdapterRouter {
                         let edit_msg = msg.clone();
                         let limit = message_limit;
                         let mut buf_rx = rx;
-                        tokio::spawn(async move {
+                        let edit_handle = tokio::spawn(async move {
                             let mut last = String::new();
+                            // Track consecutive edit failures so we can abort cosmetic
+                            // streaming when the platform stops accepting edits (e.g.
+                            // Feishu's 20-edits-per-message hard cap, errcode 230072).
+                            // Once aborted, the final delivery path still runs and the
+                            // user sees the complete content at turn end.
+                            let mut consecutive_failures: u32 = 0;
+                            const MAX_CONSECUTIVE_FAILURES: u32 = 3;
                             loop {
                                 tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
                                 if buf_rx.has_changed().unwrap_or(false) {
@@ -645,9 +652,37 @@ impl AdapterRouter {
                                         } else {
                                             content.clone()
                                         };
-                                        let _ =
-                                            edit_adapter.edit_message(&edit_msg, &display).await;
-                                        last = content;
+                                        match edit_adapter
+                                            .edit_message(&edit_msg, &display)
+                                            .await
+                                        {
+                                            Ok(_) => {
+                                                consecutive_failures = 0;
+                                                last = content;
+                                            }
+                                            Err(e) => {
+                                                consecutive_failures += 1;
+                                                tracing::debug!(
+                                                    message_id = %edit_msg.message_id,
+                                                    platform = %edit_msg.channel.platform,
+                                                    error = ?e,
+                                                    consecutive_failures,
+                                                    "mid-stream cosmetic edit failed"
+                                                );
+                                                if consecutive_failures
+                                                    >= MAX_CONSECUTIVE_FAILURES
+                                                {
+                                                    tracing::warn!(
+                                                        message_id = %edit_msg.message_id,
+                                                        platform = %edit_msg.channel.platform,
+                                                        consecutive_failures,
+                                                        "mid-stream cosmetic edit aborted; \
+                                                         final content will be delivered at turn end"
+                                                    );
+                                                    break;
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                                 if buf_rx.has_changed().is_err() {
@@ -655,9 +690,9 @@ impl AdapterRouter {
                                 }
                             }
                         });
-                        (Some(tx), Some(msg))
+                        (Some(tx), Some(msg), Some(edit_handle))
                     } else {
-                        (None, None)
+                        (None, None, None)
                     };
 
                     // (#732) Liveness-aware recv loop. Filters stale id-bearing
@@ -838,8 +873,28 @@ impl AdapterRouter {
                     }
 
                     conn.prompt_done().await;
-                    // Stop the edit loop
+                    // Stop the cosmetic edit loop before the finalize write path
+                    // issues its authoritative edit. Dropping buf_tx closes the watch
+                    // channel so the loop breaks on its next check, but it may be
+                    // mid-edit (a single edit can now block up to the gateway response
+                    // timeout). Without an explicit abort+join, a cosmetic edit issued
+                    // just before close could land *after* the finalize edit and
+                    // overwrite it with stale, mid-stream content (#1122 review NEW-1).
+                    //
+                    // abort() cancels any cosmetic edit that has not yet been put on
+                    // the wire and interrupts the inter-flush sleep immediately; the
+                    // await confirms the task is gone before we proceed. This narrows
+                    // the race to near zero — it does NOT fully eliminate it: a PUT
+                    // already flushed microseconds before abort cannot be recalled,
+                    // and if finalize's PUT travels a different pooled connection the
+                    // server-side arrival order is not strictly guaranteed. That
+                    // residual window is display-only (stale tail briefly shown) and
+                    // far narrower than before this join existed.
                     drop(buf_tx);
+                    if let Some(handle) = edit_handle {
+                        handle.abort();
+                        let _ = handle.await;
+                    }
 
                     // Parse output directives from raw text_buf BEFORE compose_display.
                     // Directives are agent meta-layer, not content — must be stripped
@@ -864,6 +919,11 @@ impl AdapterRouter {
 
                     let final_content = markdown::convert_tables(&final_content, table_mode);
                     let chunks = format::split_message(&final_content, message_limit);
+                    // Track delivery health across all final write paths. Any failure
+                    // here means the user's view is incomplete; we propagate Err at the
+                    // end of the closure so dispatch surfaces set_error (❌) instead of
+                    // silently calling set_done (🆗) over a half-delivered turn.
+                    let mut delivery_failed = false;
                     // Clear the assistant status line before delivering the final message.
                     if assistant_status {
                         let _ = adapter.set_status(&thread_channel, "").await;
@@ -871,7 +931,12 @@ impl AdapterRouter {
                     if native {
                         if let Some(msg) = &native_msg {
                             if !native_pending.is_empty() {
-                                let _ = adapter.stream_append(msg, &native_pending).await;
+                                if let Err(e) =
+                                    adapter.stream_append(msg, &native_pending).await
+                                {
+                                    tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "native finalize stream_append failed");
+                                    delivery_failed = true;
+                                }
                             }
                             // Finalize the streamed message with the first chunk (full-replace),
                             // then post any overflow chunks as new in-thread messages — mirrors
@@ -880,13 +945,26 @@ impl AdapterRouter {
                             // streaming mode — the streamed message is the in-thread reply.
                             match chunks.first() {
                                 Some(first) => {
-                                    let _ = adapter.stream_finish(msg, first).await;
+                                    if let Err(e) = adapter.stream_finish(msg, first).await {
+                                        tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "native stream_finish failed");
+                                        delivery_failed = true;
+                                    }
                                     for chunk in chunks.iter().skip(1) {
-                                        let _ = adapter.send_message(&thread_channel, chunk).await;
+                                        if let Err(e) =
+                                            adapter.send_message(&thread_channel, chunk).await
+                                        {
+                                            tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "native overflow chunk send failed");
+                                            delivery_failed = true;
+                                        }
                                     }
                                 }
                                 None => {
-                                    let _ = adapter.stream_finish(msg, &final_content).await;
+                                    if let Err(e) =
+                                        adapter.stream_finish(msg, &final_content).await
+                                    {
+                                        tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "native stream_finish (no chunks) failed");
+                                        delivery_failed = true;
+                                    }
                                 }
                             }
                         } else {
@@ -899,7 +977,12 @@ impl AdapterRouter {
                             // accumulated text_buf) as plain in-thread messages so
                             // the turn is never silently dropped.
                             for chunk in &chunks {
-                                let _ = adapter.send_message(&thread_channel, chunk).await;
+                                if let Err(e) =
+                                    adapter.send_message(&thread_channel, chunk).await
+                                {
+                                    tracing::warn!(error = ?e, platform = %thread_channel.platform, "native fallback chunk send failed");
+                                    delivery_failed = true;
+                                }
                             }
                         }
                     } else if let Some(msg) = placeholder_msg {
@@ -917,17 +1000,21 @@ impl AdapterRouter {
                                     ).await {
                                         Ok(_) => { send_ok = true; }
                                         Err(e) => {
-                                            tracing::warn!(error = ?e, "reply_to send failed; preserving placeholder");
+                                            tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "reply_to send failed; preserving placeholder");
+                                            delivery_failed = true;
                                         }
                                     }
-                                } else {
-                                    let _ = adapter.send_message(&thread_channel, chunk).await;
+                                } else if let Err(e) =
+                                    adapter.send_message(&thread_channel, chunk).await
+                                {
+                                    tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "reply_to overflow chunk send failed");
+                                    delivery_failed = true;
                                 }
                                 first = false;
                             }
                             if send_ok {
                                 if let Err(e) = adapter.delete_message(&msg).await {
-                                    tracing::warn!(error = ?e, "delete placeholder failed; placeholder will remain visible");
+                                    tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "delete placeholder failed; placeholder will remain visible");
                                 }
                             }
                         } else if adapter.platform() == "discord"
@@ -939,12 +1026,21 @@ impl AdapterRouter {
                             // event since MESSAGE_UPDATE skips notifications (#1110).
                             let mut send_ok = false;
                             if let Some(first) = chunks.first() {
-                                if adapter.send_message(&thread_channel, first).await.is_ok() {
-                                    send_ok = true;
+                                match adapter.send_message(&thread_channel, first).await {
+                                    Ok(_) => {
+                                        send_ok = true;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "discord bot-mention first chunk send failed");
+                                        delivery_failed = true;
+                                    }
                                 }
                             }
                             for chunk in chunks.iter().skip(1) {
-                                let _ = adapter.send_message(&thread_channel, chunk).await;
+                                if let Err(e) = adapter.send_message(&thread_channel, chunk).await {
+                                    tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "streaming overflow chunk send failed");
+                                    delivery_failed = true;
+                                }
                             }
                             if send_ok {
                                 let _ = adapter.delete_message(&msg).await;
@@ -955,14 +1051,42 @@ impl AdapterRouter {
                             // new message instead — the gateway will persist via sendRichMessage.
                             if msg.message_id == "draft" {
                                 for chunk in &chunks {
-                                    let _ = adapter.send_message(&thread_channel, chunk).await;
+                                    if let Err(e) =
+                                        adapter.send_message(&thread_channel, chunk).await
+                                    {
+                                        tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "draft placeholder fallback chunk send failed");
+                                        delivery_failed = true;
+                                    }
                                 }
-                            } else {
-                                if let Some(first) = chunks.first() {
-                                    let _ = adapter.edit_message(&msg, first).await;
+                            } else if let Some(first) = chunks.first() {
+                                // If the placeholder edit fails (e.g. Feishu's
+                                // 20-edits-per-message cap was hit during
+                                // cosmetic streaming and the gateway reports
+                                // edit_cap_reached), fall back to deleting the
+                                // half-edited placeholder and sending the first
+                                // chunk as a fresh message so the user sees the
+                                // complete reply without overlap. If delete
+                                // fails the placeholder simply remains — same
+                                // UX as pre-recovery, not a hard failure.
+                                if let Err(e) = adapter.edit_message(&msg, first).await {
+                                    tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "final streaming edit failed; deleting placeholder and sending fresh");
+                                    if let Err(de) = adapter.delete_message(&msg).await {
+                                        tracing::warn!(error = ?de, platform = %thread_channel.platform, message_id = %msg.message_id, "delete placeholder failed; user will see overlap");
+                                    }
+                                    if let Err(e2) =
+                                        adapter.send_message(&thread_channel, first).await
+                                    {
+                                        tracing::error!(error = ?e2, platform = %thread_channel.platform, message_id = %msg.message_id, "fallback send_message also failed");
+                                        delivery_failed = true;
+                                    }
                                 }
                                 for chunk in chunks.iter().skip(1) {
-                                    let _ = adapter.send_message(&thread_channel, chunk).await;
+                                    if let Err(e) =
+                                        adapter.send_message(&thread_channel, chunk).await
+                                    {
+                                        tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "streaming overflow chunk send failed");
+                                        delivery_failed = true;
+                                    }
                                 }
                             }
                         }
@@ -973,22 +1097,37 @@ impl AdapterRouter {
                         for chunk in &chunks {
                             if first {
                                 if let Some(ref reply_id) = directives.reply_to {
-                                    let _ = adapter.send_message_with_reply(
+                                    if let Err(e) = adapter.send_message_with_reply(
                                         &thread_channel,
                                         chunk,
                                         reply_id,
-                                    ).await;
-                                } else {
-                                    let _ = adapter.send_message(&thread_channel, chunk).await;
+                                    ).await {
+                                        tracing::warn!(error = ?e, platform = %thread_channel.platform, "send-once reply_to first chunk failed");
+                                        delivery_failed = true;
+                                    }
+                                } else if let Err(e) =
+                                    adapter.send_message(&thread_channel, chunk).await
+                                {
+                                    tracing::warn!(error = ?e, platform = %thread_channel.platform, "send-once first chunk failed");
+                                    delivery_failed = true;
                                 }
-                            } else {
-                                let _ = adapter.send_message(&thread_channel, chunk).await;
+                            } else if let Err(e) =
+                                adapter.send_message(&thread_channel, chunk).await
+                            {
+                                tracing::warn!(error = ?e, platform = %thread_channel.platform, "send-once subsequent chunk failed");
+                                delivery_failed = true;
                             }
                             first = false;
                         }
                     }
 
-                    Ok(())
+                    if delivery_failed {
+                        Err(anyhow::anyhow!(
+                            "streaming finalization had delivery failures; user view is incomplete"
+                        ))
+                    } else {
+                        Ok(())
+                    }
                 })
             })
             .await

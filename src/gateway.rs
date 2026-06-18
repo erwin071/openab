@@ -13,6 +13,33 @@ use tracing::{error, info, warn};
 /// Timeout for waiting on gateway reply acknowledgement.
 const GATEWAY_REPLY_TIMEOUT_SECS: u64 = 5;
 
+/// Platforms whose gateway adapter emits a `GatewayResponse` for `edit_message`
+/// so core can observe edit success or failure (used to gate the per-edit
+/// response-wait below).
+///
+/// Today only Feishu does, because it is the only adapter with a known
+/// per-message edit cap (errcode 230072) that requires core-side recovery, and
+/// the only one wired to ack edits.
+///
+/// NOTE: this gates the `edit_message` response-wait only. `delete_message` is
+/// unconditionally fire-and-forget (the recovery path sends fresh content
+/// regardless of the delete outcome), so it does not consult this list.
+///
+/// TECH DEBT: this is platform-identity standing in for a *capability*. The
+/// right model is a capability handshake at gateway-connect time ("does this
+/// adapter acknowledge edits?") rather than a hardcoded platform name. We
+/// accept the hardcode now because there is no handshake protocol yet; when one
+/// lands, replace this allowlist with a negotiated capability flag. Any new
+/// adapter that wires request/response for edits MUST be added here, or its
+/// edit failures stay invisible to core (silent failure mode).
+const EDIT_RESPONSE_PLATFORMS: &[&str] = &["feishu"];
+
+/// Whether `platform` acknowledges `edit_message` with a `GatewayResponse`.
+/// See `EDIT_RESPONSE_PLATFORMS`.
+fn platform_acks_writes(platform: &str) -> bool {
+    EDIT_RESPONSE_PLATFORMS.contains(&platform)
+}
+
 // --- Gateway event/reply schemas (mirrors gateway service) ---
 
 #[derive(Clone, Debug, Deserialize)]
@@ -200,15 +227,29 @@ impl GatewayAdapter {
         let msg_id = if let (Some(rx), Some(ref id)) = (pending_rx, &req_id) {
             match tokio::time::timeout(std::time::Duration::from_secs(GATEWAY_REPLY_TIMEOUT_SECS), rx).await {
                 Ok(Ok(resp)) if resp.success => resp.message_id.unwrap_or_else(|| "gw_sent".into()),
-                Ok(Ok(_resp)) => {
-                    tracing::warn!(request_id = %id, "gateway replied with failure");
-                    "gw_sent".into()
+                Ok(Ok(resp)) => {
+                    // Gateway explicitly reported failure (success=false). Surface
+                    // as Err so dispatch sets ❌ instead of 🆗 over an incomplete
+                    // delivery. Examples: Feishu edit cap reached after append-new
+                    // fallback also failed; chunked send delivered N/M chunks.
+                    let err_msg = resp.error.clone()
+                        .unwrap_or_else(|| "gateway reported failure".to_string());
+                    tracing::warn!(request_id = %id, error = %err_msg, "gateway replied with failure");
+                    return Err(anyhow::anyhow!("gateway reported failure: {err_msg}"));
                 }
                 Ok(Err(_)) => {
+                    // Channel closed (gateway shutting down or pending dropped).
+                    // Maintain legacy behavior — adapters that don't implement
+                    // GatewayResponse for all reply types (LINE, Teams) rely on
+                    // this for non-failure outcomes.
                     tracing::warn!(request_id = %id, "gateway response channel closed");
                     "gw_sent".into()
                 }
                 Err(_) => {
+                    // Timeout. Many adapters (LINE, Teams) intentionally do not
+                    // emit GatewayResponse for replies, so timeout is the expected
+                    // path for them. Maintain legacy behavior to avoid breaking
+                    // platforms that have not yet wired request/response feedback.
                     tracing::warn!(request_id = %id, "gateway reply timed out");
                     self.pending.lock().await.remove(id);
                     "gw_sent".into()
@@ -497,6 +538,31 @@ impl ChatAdapter for GatewayAdapter {
     }
 
     async fn edit_message(&self, msg: &MessageRef, content: &str) -> Result<()> {
+        // Use a short request/response cycle so we can react to platform-level
+        // edit failures (e.g. Feishu's 20-edits-per-message cap, errcode 230072).
+        // Without this, edit_message was fire-and-forget and core never saw cap
+        // signals — cosmetic streaming would keep flushing forever and the final
+        // edit fallback to send_message could not trigger.
+        //
+        // Scope intentionally limited to platforms that ack writes (see
+        // EDIT_RESPONSE_PLATFORMS). Other adapters (LINE, Teams, Slack, Discord,
+        // …) keep the original fire-and-forget path so cosmetic streaming on
+        // those platforms does not pay a response-wait penalty per flush.
+        const EDIT_RESPONSE_TIMEOUT_MS: u64 = 800;
+        let needs_response = self.streaming && platform_acks_writes(&msg.channel.platform);
+
+        let req_id = if needs_response {
+            Some(format!("req_{}", uuid::Uuid::new_v4()))
+        } else {
+            None
+        };
+        let pending_rx = if let Some(ref id) = req_id {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            self.pending.lock().await.insert(id.clone(), tx);
+            Some(rx)
+        } else {
+            None
+        };
         let reply = GatewayReply {
             schema: "openab.gateway.reply.v1".into(),
             reply_to: msg.message_id.clone(),
@@ -510,6 +576,75 @@ impl ChatAdapter for GatewayAdapter {
                 text: content.into(),
             },
             command: Some("edit_message".into()),
+            quote_message_id: None,
+            request_id: req_id.clone(),
+        };
+        let json = serde_json::to_string(&reply)?;
+        if let Err(e) = self.ws_tx.lock().await.send(Message::Text(json)).await {
+            if let Some(ref id) = req_id {
+                self.pending.lock().await.remove(id);
+            }
+            return Err(e.into());
+        }
+        if let (Some(rx), Some(ref id)) = (pending_rx, &req_id) {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(EDIT_RESPONSE_TIMEOUT_MS),
+                rx,
+            ).await {
+                Ok(Ok(resp)) if resp.success => Ok(()),
+                Ok(Ok(resp)) => {
+                    let err_msg = resp.error.clone()
+                        .unwrap_or_else(|| "gateway reported edit failure".to_string());
+                    tracing::warn!(request_id = %id, error = %err_msg, "edit_message gateway replied failure");
+                    Err(anyhow::anyhow!("edit failure: {err_msg}"))
+                }
+                Ok(Err(_)) => {
+                    tracing::debug!(request_id = %id, "edit_message gateway response channel closed");
+                    Ok(())
+                }
+                Err(_) => {
+                    // Timeout — feishu didn't respond within the window
+                    // (probably a slow API). Treat as success to avoid
+                    // false-positive ❌; the cap-reached path already short-
+                    // circuits much faster (gateway returns immediately).
+                    self.pending.lock().await.remove(id);
+                    Ok(())
+                }
+            }
+        } else {
+            // Non-feishu (or non-streaming): fire-and-forget, no added latency.
+            Ok(())
+        }
+    }
+
+    /// Override default delete_message (which falls back to edit-to-zero-width)
+    /// so platforms with native delete APIs (e.g. Feishu DELETE /im/v1/messages/{id})
+    /// can perform real deletions. Critical for the streaming-edit-cap recovery
+    /// path: when Feishu's 20-edits-per-message cap is hit and we send full
+    /// content as a fresh message, we need to remove the half-edited placeholder
+    /// to avoid duplicated content. The default zero-width-edit fallback would
+    /// itself fail on a cap-reached message, leaving the placeholder visible.
+    ///
+    /// Fire-and-forget: gateway adapters that don't implement delete will simply
+    /// ignore the command. Failure is non-fatal — if delete fails, the user sees
+    /// the placeholder remain (same behavior as before this override). We do not
+    /// wait on a response here: the recovery path sends fresh content regardless
+    /// of whether the delete landed, so a response would only buy an extra log
+    /// line at the cost of a per-finalize wait.
+    async fn delete_message(&self, msg: &MessageRef) -> Result<()> {
+        let reply = GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: msg.message_id.clone(),
+            platform: msg.channel.platform.clone(),
+            channel: ReplyChannel {
+                id: msg.channel.channel_id.clone(),
+                thread_id: msg.channel.thread_id.clone(),
+            },
+            content: ReplyContent {
+                content_type: "text".into(),
+                text: String::new(),
+            },
+            command: Some("delete_message".into()),
             quote_message_id: None,
             request_id: None,
         };
