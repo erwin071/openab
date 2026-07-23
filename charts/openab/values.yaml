@@ -88,6 +88,28 @@ agents:
     #     existingClaim: ""  # set to reuse an existing PVC (skips PVC creation)
     #     storageClass: ""
     #     size: 1Gi
+    #   # configToml: provide a raw config.toml string instead of using the Helm-rendered template.
+    #   # The content is mounted verbatim — no field mapping, no validation. Secrets must still be
+    #   # injected via secretEnv (they render as env vars and are referenced as ${VAR} in the TOML).
+    #   # When set, all adapter fields (slack.*, discord.*, pool.*, etc.) are ignored for rendering.
+    #   # Can be set inline (below) or loaded as-is from a standalone file (WYSIWYG editing, full
+    #   # TOML syntax highlighting/schema validation in your editor) via:
+    #   #   helm upgrade ... --set-file agents.<name>.configToml=./config.toml
+    #   # Example:
+    #   # configToml: |
+    #   #   [slack]
+    #   #   bot_token = "${SLACK_BOT_TOKEN}"
+    #   #   allowed_channels = ["C01234567"]
+    #   #   allow_user_messages = "mentions"
+    #   #
+    #   #   [agent]
+    #   #   command = "claude-agent-acp"
+    #   #   inherit_env = ["ANTHROPIC_API_KEY"]
+    #   #
+    #   #   [pool]
+    #   #   max_sessions = 10
+    #   #   session_ttl_hours = 24
+    #   configToml: ""
     #   # ⚠️ When set, this ConfigMap mount shadows any file at the same path on the PVC.
     #   # The PVC file is NOT deleted but becomes invisible to the agent. Remove agentsMd to restore.
     #   agentsMd: ""
@@ -95,7 +117,7 @@ agents:
     #   nodeSelector: {}
     #   tolerations: []
     #   affinity: {}
-    #   image: "ghcr.io/openabdev/openab-claude"  # tag omitted → auto-appends appVersion
+    #   image: ""  # leave empty → auto-resolves to openab:<tag>-claude (unified format)
     # opencode:
     #   command: opencode
     #   args:
@@ -125,7 +147,33 @@ agents:
     #     size: 1Gi
     #   agentsMd: ""
     #   resources: {}
-    #   image: "ghcr.io/openabdev/openab-opencode:latest"
+    #   image: ""  # leave empty → auto-resolves to openab:<tag>-opencode
+    # kimi:
+    #   command: kimi
+    #   args:
+    #     - acp
+    #   discord:
+    #     enabled: true
+    #     allowedChannels:
+    #       - "YOUR_CHANNEL_ID"
+    #     allowedUsers: []
+    #     allowBotMessages: "off"
+    #     trustedBotIds: []
+    #   workingDir: /home/node
+    #   env: {}
+    #   envFrom: []
+    #   secretEnv: []
+    #   pool:
+    #     maxSessions: 10
+    #     sessionTtlHours: 24
+    #   reactions:
+    #     enabled: true
+    #     removeAfterReply: false
+    #   persistence:
+    #     enabled: true
+    #     storageClass: ""
+    #     size: 1Gi
+    #   image: ""  # leave empty → auto-resolves to openab:<tag>-kimi
     # pi:
     #   command: pi-acp
     #   discord:
@@ -152,7 +200,7 @@ agents:
     #     enabled: true
     #     storageClass: ""
     #     size: 1Gi
-    #   image: "ghcr.io/openabdev/openab-pi:latest"
+    #   image: ""  # leave empty → auto-resolves to openab:<tag>-pi
     # cursor:
     #   command: cursor-agent
     #   args:
@@ -183,7 +231,7 @@ agents:
     #     existingClaim: ""  # set to reuse an existing PVC (skips PVC creation)
     #     storageClass: ""
     #     size: 1Gi
-    #   image: "ghcr.io/openabdev/openab-cursor:latest"
+    #   image: ""  # leave empty → auto-resolves to openab:<tag>-cursor
     # hermes:
     #   command: hermes-acp
     #   discord:
@@ -204,7 +252,7 @@ agents:
     #     enabled: true
     #     storageClass: ""
     #     size: 1Gi
-    #   image: "ghcr.io/openabdev/openab-hermes"
+    #   image: ""  # leave empty → auto-resolves to openab:<tag>-hermes
     # grok:
     #   command: grok
     #   args:
@@ -232,7 +280,7 @@ agents:
     #     enabled: true
     #     storageClass: ""
     #     size: 1Gi
-    #   image: "ghcr.io/openabdev/openab-grok"
+    #   image: ""  # leave empty → auto-resolves to openab:<tag>-grok
     image: ""
     # configUrl: when set, openab uses `-c <URL>` to fetch config remotely
     # instead of mounting the chart-generated ConfigMap. The ConfigMap and its
@@ -302,6 +350,12 @@ agents:
       # AI app with the `assistant:write` scope (plus chat:write). Default: true — set to
       # false for non-AI Slack apps (without assistant:write) to keep emoji-reaction status.
       assistantMode: true
+      # streaming: master switch for live reply streaming. Default true. Set
+      # false to always post a single final message (send-once) — no native
+      # streaming, no post+edit placeholder — regardless of assistantMode.
+      # Useful in multi-agent threads to avoid streamed-message edit states
+      # re-firing app_mention.
+      streaming: true
       # allowAllChannels/allowAllUsers: same auto-infer logic as discord
       allowedChannels: []  # empty + no allowAllChannels → allow all (auto-inferred)
       allowedUsers: []     # empty + no allowAllUsers → allow all (auto-inferred)
@@ -346,6 +400,11 @@ agents:
       # compact: show count summary (e.g. ✅ 3 · 🔧 1 tool(s))
       # full: show complete tool titles (for debugging)
       # none: hide tool lines entirely
+      # narrationDisplay: default false. In send-once mode, deliver ONLY the final
+      # answer block (text after the last tool call); inter-tool narration is
+      # dropped. Set true to keep the full text. Platform-agnostic (Slack
+      # streaming=false, multi-bot threads, gateway). No effect while streaming.
+      # narrationDisplay: false
     stt:
       enabled: false
       apiKey: ""

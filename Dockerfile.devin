@@ -1,0 +1,64 @@
+# --- Build stage ---
+FROM rust:1-bookworm AS builder
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY crates/openab-core/Cargo.toml crates/openab-core/Cargo.toml
+COPY crates/openab-gateway/Cargo.toml crates/openab-gateway/Cargo.toml
+RUN mkdir -p src crates/openab-core/src crates/openab-gateway/src \
+    && echo 'fn main() {}' > src/main.rs \
+    && echo '' > crates/openab-core/src/lib.rs \
+    && echo '' > crates/openab-gateway/src/lib.rs \
+    && cargo build --release \
+    && rm -rf src crates/openab-core/src crates/openab-gateway/src
+COPY crates/ crates/
+COPY src/ src/
+RUN touch src/main.rs crates/openab-core/src/lib.rs crates/openab-gateway/src/lib.rs && cargo build --release
+
+# --- Runtime stage ---
+FROM debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl procps ripgrep tini git unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Devin CLI (pinned version with SHA256 verification)
+ARG DEVIN_VERSION=3000.2.17
+ARG DEVIN_SHA256_AMD64=f0e1e9363afc6ee68c4ef87bab4aeb7ff5cc08a5fa838350ef3ceefdbb2a2be2
+ARG DEVIN_SHA256_ARM64=116dc71ef085a922bc3ff0ea0377d4b26c529a431d58246e36572913e2d25624
+ARG TARGETPLATFORM
+RUN set -eux; \
+    case "${TARGETPLATFORM:-linux/amd64}" in \
+      "linux/amd64") arch=x86_64-unknown-linux; sha="${DEVIN_SHA256_AMD64}" ;; \
+      "linux/arm64") arch=aarch64-unknown-linux; sha="${DEVIN_SHA256_ARM64}" ;; \
+      *) echo "Unsupported platform: ${TARGETPLATFORM}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://static.devin.ai/cli/${DEVIN_VERSION}/devin-${DEVIN_VERSION}-${arch}.tar.gz" \
+      -o /tmp/devin.tar.gz && \
+    echo "${sha}  /tmp/devin.tar.gz" | sha256sum -c - && \
+    tar xzf /tmp/devin.tar.gz -C /tmp && \
+    install -m 0755 /tmp/bin/devin /usr/local/bin/devin && \
+    rm -rf /tmp/devin* /tmp/bin /tmp/share
+
+# Install gh CLI
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list && \
+    apt-get update && apt-get install -y --no-install-recommends gh && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN useradd -m -s /bin/bash -u 1000 agent
+ENV HOME=/home/agent
+WORKDIR /home/agent
+
+COPY --from=builder --chown=agent:agent /build/target/release/openab /usr/local/bin/openab
+
+RUN chown -R agent:agent /home/agent
+
+USER agent
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD pgrep -x openab || exit 1
+ENV OPENAB_AGENT_COMMAND="devin acp"
+ENV OPENAB_AGENT_AUTH_COMMAND="devin auth login --force-manual-token-flow"
+
+ENTRYPOINT ["tini", "--"]
+CMD ["openab", "run", "-c", "/etc/openab/config.toml"]

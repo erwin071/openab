@@ -1,5 +1,37 @@
 # LINE Setup
 
+
+> **Unified Mode (v0.9.0+):** The OAB binary now embeds the line adapter directly. Set `LINE_CHANNEL_SECRET` as an env var — no separate gateway container or `[gateway]` config needed. See [Telegram docs](telegram.md#unified-mode-recommended) for the pattern.
+
+### Unified Config (Kiro + line)
+
+**Minimal:**
+
+```toml
+[agent]
+env = { KIRO_API_KEY = "${KIRO_API_KEY}" }
+```
+
+**Recommended:**
+
+```toml
+[agent]
+env = { KIRO_API_KEY = "${KIRO_API_KEY}" }
+
+[pool]
+max_sessions = 3
+session_ttl_hours = 1
+
+[reactions]
+tool_display = "compact"
+
+[markdown]
+tables = "off"
+```
+
+Set `LINE_CHANNEL_SECRET` (and related platform env vars) on the container. No `[gateway]` needed.
+
+
 Connect a LINE bot to OpenAB via the Custom Gateway.
 
 ```
@@ -66,12 +98,33 @@ platform = "line"
 # allowed_channels = ["C1234567890abcdef"] # restrict to specific chat/group IDs
 
 [agent]
-command = "kiro-cli"
-args = ["acp", "--trust-all-tools"]
-working_dir = "/home/agent"
 ```
 
 > **Tip:** To find a LINE user ID, check the gateway logs — the sender ID is logged for each incoming message. By default all users and channels are allowed. Setting `allowed_users` or `allowed_channels` automatically restricts access to only those listed.
+
+### User Trust (`[line]` section)
+
+> **Trust resolution:** the `[line]` section's trust settings apply in **both** deployment modes. Broker-side enforcement goes through the shared per-platform trust registry with precedence `GATEWAY_*` env < `[gateway]` section < `[line]` section — in the standalone-gateway mode, the broker's WebSocket path consults the same registry, so a `[line]` section overrides `[gateway].allow_all_users` / `allowed_users` for this platform.
+
+Identity trust defaults to **deny-all** (identity-trust-none ADR): unknown senders are rejected until explicitly admitted. Configure trust with a first-class `[line]` section:
+
+```toml
+[line]
+allowed_users = ["U1234567890abcdef0123456789abcdef"]  # LINE user IDs (U…, 33 chars)
+# allow_all_users = true   # explicit opt-in only — any user can drive the agent
+```
+
+Each field falls back to its `LINE_*` env var when unset. Since #1376 the section also carries the channel credentials (`channel_secret`, `channel_access_token`) and `webhook_path` — config-first, env as fallback:
+
+```toml
+[line]
+channel_secret       = "${LINE_CHANNEL_SECRET}"
+channel_access_token = "${LINE_CHANNEL_ACCESS_TOKEN}"
+```
+
+This replaces the uniform `GATEWAY_ALLOW_ALL_USERS` / `GATEWAY_ALLOWED_USERS` env vars for LINE:
+
+> ⚠️ **Deprecated:** driving LINE trust through `GATEWAY_ALLOW_ALL_USERS` / `GATEWAY_ALLOWED_USERS` still works but logs a startup warning; it will become a startup error in a later phase. Migrate to `[line]` (or `LINE_*` env vars).
 
 ## 6. Add the Bot as Friend
 
@@ -82,6 +135,7 @@ In the LINE Developers Console → **Messaging API** tab → scan the QR code wi
 ### Supported
 
 - **1:1 chat** — send a message to the bot, get an AI agent response
+- **Inbound voice messages in 1:1 chat** — LINE-hosted audio messages are downloaded through the LINE Content API and forwarded to OpenAB as `audio` attachments, so the existing STT flow can transcribe them. This requires `[stt] enabled = true` in OpenAB core. See [STT (Speech-to-Text)](stt.md).
 - **Group chat** — add the bot to a group; it responds only when @-mentioned (see @mention gating below)
 - **Inbound images** — user-sent LINE images are downloaded through the LINE Content API and forwarded to OpenAB as image attachments
 - **Webhook signature validation** — HMAC-SHA256 via `LINE_CHANNEL_SECRET`
@@ -97,17 +151,22 @@ In the LINE Developers Console → **Messaging API** tab → scan the QR code wi
 - **Reactions** — LINE Bot API does not support message reactions.
 - **@mention gating** — Supported (zero-config). In group/room chats the gateway only forwards messages where the bot is explicitly @-mentioned (LINE's native `mentionees[].isSelf` signal). 1:1 DMs are always forwarded. No env var is needed.
   - *Limitation — non-text messages*: LINE only attaches mention data to text messages. Images, videos, stickers, files, and location messages in groups are silently dropped because they cannot carry an @-mention.
+  - *Limitation — group voice messages*: LINE voice/audio messages in groups and rooms are also dropped today because audio messages do not carry mention metadata. This PR only enables inbound voice STT for 1:1 chats.
   - *Limitation — `@All`*: A group-wide `@All` mention does **not** trigger the bot; only a direct `@BotName` mention does.
   - *Breaking change*: This gating is always active. Deployments that previously relied on the bot responding to all group messages will need to @-mention the bot after upgrading.
 - **Markdown rendering** — LINE uses its own text formatting. Agent replies are sent as plain text.
 - **External-content images** — LINE image messages backed by `contentProvider.type = "external"` are not downloaded yet.
+- **External-content audio** — LINE audio messages backed by `contentProvider.type = "external"` are not downloaded yet.
 
 ## Environment Variables
 
 | Variable | Required | Description |
 |---|---|---|
-| `LINE_CHANNEL_SECRET` | Yes | Channel secret for webhook signature validation |
-| `LINE_CHANNEL_ACCESS_TOKEN` | Yes | Channel access token for Reply/Push Message API and LINE-hosted image downloads |
+| `LINE_CHANNEL_SECRET` | Yes* | Channel secret for webhook signature validation. *Fallback for `[line].channel_secret` — config wins |
+| `LINE_CHANNEL_ACCESS_TOKEN` | Yes* | Channel access token for Reply/Push Message API and LINE-hosted image/audio downloads. *Fallback for `[line].channel_access_token` — config wins |
+| `LINE_WEBHOOK_PATH` | No | Webhook mount path. Fallback for `[line].webhook_path` (default `/webhook/line`) |
+| `LINE_ALLOW_ALL_USERS` | No | `true` = any user may interact. Fallback for `[line].allow_all_users`; default deny-all |
+| `LINE_ALLOWED_USERS` | No | Comma-separated LINE user IDs. Fallback for `[line].allowed_users` |
 
 ## Troubleshooting
 
@@ -115,6 +174,12 @@ In the LINE Developers Console → **Messaging API** tab → scan the QR code wi
 - Verify webhook URL is correct and shows ✅ in LINE Developers Console
 - Check **Use webhook** is ON and **Auto-reply messages** is OFF
 - Check gateway logs: `kubectl logs -l app=openab-gateway`
+
+**Voice message doesn't transcribe:**
+- Confirm you sent the voice message in a **1:1 chat**, not a group or room
+- Confirm `[stt] enabled = true` in your OpenAB config
+- Confirm the STT provider is configured correctly; see [STT (Speech-to-Text)](stt.md)
+- Check gateway logs for `media stored` and OpenAB logs for downstream dispatch
 
 **"Invalid signature" in gateway logs:**
 - Verify `LINE_CHANNEL_SECRET` matches the value in LINE Developers Console

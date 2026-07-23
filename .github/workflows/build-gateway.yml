@@ -35,9 +35,11 @@ jobs:
 
       - name: Resolve tag
         id: tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ inputs.tag }}"
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            TAG="$INPUT_TAG"
           else
             TAG="${GITHUB_REF_NAME}"
           fi
@@ -58,7 +60,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: gateway/Dockerfile
+          file: Dockerfile.gateway
           platforms: ${{ matrix.platform.os }}
           outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ inputs.dry_run != true }}
           cache-from: type=gha,scope=gateway-${{ matrix.platform.os }}
@@ -66,10 +68,11 @@ jobs:
 
       - name: Export digest
         if: inputs.dry_run != true
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"
+          touch "/tmp/digests/${DIGEST#sha256:}"
 
       - name: Upload digest
         if: inputs.dry_run != true
@@ -89,9 +92,11 @@ jobs:
     steps:
       - name: Resolve tag
         id: tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ inputs.tag }}"
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            TAG="$INPUT_TAG"
           else
             TAG="${GITHUB_REF_NAME}"
           fi
@@ -111,13 +116,15 @@ jobs:
           merge-multiple: true
 
       - name: Create multi-arch manifest
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
         run: |
           cd /tmp/digests
           docker buildx imagetools create \
-            -t ${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.version }} \
-            -t ${{ env.IMAGE_NAME }}:v${{ steps.tag.outputs.version }} \
-            -t ${{ env.IMAGE_NAME }}:latest \
-            $(printf '${{ env.IMAGE_NAME }}@sha256:%s ' *)
+            -t "${IMAGE_NAME}:${VERSION}" \
+            -t "${IMAGE_NAME}:v${VERSION}" \
+            -t "${IMAGE_NAME}:latest" \
+            $(printf "${IMAGE_NAME}@sha256:%s " *)
 
   release:
     needs: [build, merge]
@@ -130,9 +137,11 @@ jobs:
 
       - name: Resolve version
         id: tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ inputs.tag }}"
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            TAG="$INPUT_TAG"
           else
             TAG="${GITHUB_REF_NAME}"
           fi
@@ -142,13 +151,15 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          VERSION: ${{ steps.tag.outputs.version }}
         run: |
-          TAG="${{ steps.tag.outputs.tag }}"
-          VERSION="${{ steps.tag.outputs.version }}"
           cat > /tmp/release-notes.md << EOF
-          ## OpenAB Custom Gateway v${VERSION}
+          ## OpenAB Gateway v${VERSION}
 
-          Standalone gateway service — bridges webhook-based platforms to OAB via WebSocket.
+          Unified binary with all gateway adapters (Telegram, LINE, Feishu, Google Chat, WeCom, Teams) compiled in via \`BUILD_MODE=unified\`.
+
+          > **Note**: This image contains the full openab binary with all adapters enabled, not a standalone gateway process. It replaces the previous standalone gateway binary.
 
           ### Docker
 
@@ -160,7 +171,7 @@ jobs:
 
           ### Links
 
-          - [Gateway README](https://github.com/openabdev/openab/blob/main/gateway/README.md)
+          - [Gateway Crate README](https://github.com/openabdev/openab/blob/main/crates/openab-gateway/README.md)
           - [ADR: Custom Gateway](https://github.com/openabdev/openab/blob/main/docs/adr/custom-gateway.md)
           EOF
           sed -i 's/^          //' /tmp/release-notes.md

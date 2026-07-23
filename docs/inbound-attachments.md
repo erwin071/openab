@@ -25,7 +25,7 @@ User sends media (photo/voice/file)
 | **Feishu** | ✅ | ✅ (STT) | ✅ (whitelist) | skipped | skipped |
 | **Google Chat** | ✅ | ✅ (STT) | ✅ (whitelist) | skipped | Drive files skipped |
 | **WeCom** | ✅ | — | ✅ (whitelist) | skipped | skipped |
-| **LINE** | ✅ (LINE-hosted only) | — | — | — | — |
+| **LINE** | ✅ (LINE-hosted only) | ✅ (STT, 1:1 only, LINE-hosted only) | — | — | — |
 | **Slack** | ✅ | ✅ (STT) | ✅ | — | skipped |
 
 ## Processing Pipeline
@@ -49,6 +49,10 @@ OpenAB can create the ACP image block, but downstream coding agents and selected
 3. Core reads bytes → STT transcription (Whisper/Groq) → `[Voice message transcript]: ...`
 4. If STT disabled: silently skipped
 
+LINE-specific note:
+- LINE voice-message STT currently works in **1:1 chats only**.
+- LINE group/room voice messages are still blocked by mention gating because LINE does not attach mention metadata to audio messages.
+
 ### Text Files (Documents)
 
 1. Gateway downloads file
@@ -59,7 +63,7 @@ OpenAB can create the ACP image block, but downstream coding agents and selected
 
 ### Unsupported Types
 
-Binary files (zip, pdf, exe, docx), video, and stickers are **silently skipped**. The agent does not receive any notification that a file was sent.
+Binary files (zip, pdf, exe, docx), video, and stickers are **rejected with a status reason**. The agent receives a `[System: attachment "..." was not delivered — unsupported format: ...]` notification so it can inform the user.
 
 ## Size Limits
 

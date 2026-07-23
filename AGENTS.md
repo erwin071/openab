@@ -75,9 +75,17 @@ Never leak `DISCORD_BOT_TOKEN` or other OAB credentials to the agent.
 
 ### 4. Dockerfile Discipline
 
-There are 11 Dockerfiles: `Dockerfile`, `Dockerfile.antigravity`, `Dockerfile.claude`, `Dockerfile.codex`, `Dockerfile.copilot`, `Dockerfile.cursor`, `Dockerfile.gemini`, `Dockerfile.grok`, `Dockerfile.hermes`, `Dockerfile.opencode`, `Dockerfile.pi`.
+The primary Dockerfile is `Dockerfile.unified` (multi-target, all variants). Legacy per-agent Dockerfiles exist but are deprecated.
 
-A change to one MUST be evaluated against ALL. Common layers (base image, openab binary, tini) are shared — update all or explain why not.
+A change to common layers (base image, openab binary, tini) affects ALL variants — test broadly.
+
+**Builder image is pinned by digest** in `Dockerfile.unified`. Do NOT change `rust:1-bookworm` to an unpinned rolling tag. The digest prevents silent glibc upgrades that break runtime compatibility. Update it only when intentionally upgrading the Rust toolchain:
+
+```bash
+docker pull rust:1-bookworm
+docker inspect rust:1-bookworm --format '{{index .RepoDigests 0}}'
+# Update the @sha256:... in Dockerfile.unified
+```
 
 ### 5. Cross-Platform
 
@@ -134,6 +142,10 @@ cargo check --target x86_64-pc-windows-gnu
 - Commit message: `type(scope): description` — types: `feat`, `fix`, `docs`, `refactor`, `test`, `ci`, `build`
 - Include regression tests for bug fixes
 - Reference issues: `Closes #123` or `Fixes #456`
+- Every PR must include the Review Contract required by [`docs/review-contract.md`](docs/review-contract.md)
+- Round 1 may challenge and then freezes the contract; later rounds review only unresolved findings, incremental changes, regressions, and frozen acceptance criteria
+- Classify post-freeze findings as `ORIGINAL`, `REGRESSION`, `NEW EVIDENCE`, or `SCOPE EXPANSION`; scope expansion is a non-blocking follow-up unless direct correctness, security, or data-loss evidence passes the Late Blocker Gate
+- Use the default three-stage stopping rule: full review, fix verification, final regression check; only a maintainer/owner may revise the contract or authorize another round
 
 ## ADRs
 

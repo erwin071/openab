@@ -1,5 +1,37 @@
 # Google Chat Setup
 
+
+> **Unified Mode (v0.9.0+):** The OAB binary now embeds the google-chat adapter directly. Set `GOOGLE_CHAT_ENABLED=true` as an env var — no separate gateway container or `[gateway]` config needed. See [Telegram docs](telegram.md#unified-mode-recommended) for the pattern.
+
+### Unified Config (Kiro + google-chat)
+
+**Minimal:**
+
+```toml
+[agent]
+env = { KIRO_API_KEY = "${KIRO_API_KEY}" }
+```
+
+**Recommended:**
+
+```toml
+[agent]
+env = { KIRO_API_KEY = "${KIRO_API_KEY}" }
+
+[pool]
+max_sessions = 3
+session_ttl_hours = 1
+
+[reactions]
+tool_display = "compact"
+
+[markdown]
+tables = "off"
+```
+
+Set `GOOGLE_CHAT_ENABLED=true` (and related platform env vars) on the container. No `[gateway]` needed.
+
+
 Connect a Google Chat app to OpenAB via the Custom Gateway.
 
 ```
@@ -118,10 +150,35 @@ allow_all_channels = true
 allow_all_users = true
 
 [agent]
-command = "kiro-cli"
-args = ["acp", "--trust-all-tools"]
-working_dir = "/home/agent"
 ```
+
+### `[googlechat]` Section (credentials + trust)
+
+Since #1379 the `[googlechat]` section carries the full adapter configuration — config-first with `GOOGLE_CHAT_*` env fallback:
+
+```toml
+[googlechat]
+enabled     = true
+sa_key_json = "${GOOGLE_CHAT_SA_KEY_JSON}"
+audience    = "projects/<project-number>/..."   # enables webhook JWT verification (L1)
+allowed_users = ["users/123456789"]
+```
+
+### User Trust (`[googlechat]` section)
+
+> **Trust resolution:** the `[googlechat]` section's trust settings apply in **both** deployment modes (enable the embedded adapter with `[googlechat] enabled = true`; `GOOGLE_CHAT_ENABLED=true` remains the env-only fallback). Broker-side enforcement goes through the shared per-platform trust registry with precedence `GATEWAY_*` env < `[gateway]` section < `[googlechat]` section — in the standalone-gateway mode, the broker's WebSocket path consults the same registry, so a `[googlechat]` section overrides `[gateway].allow_all_users` / `allowed_users` for this platform.
+
+Identity trust defaults to **deny-all** (identity-trust-none ADR): unknown senders are rejected until explicitly admitted. Configure trust with a first-class `[googlechat]` section:
+
+```toml
+[googlechat]
+allowed_users = ["users/123456789"]  # Chat user resource names (users/<id>)
+# allow_all_users = true   # explicit opt-in only — any user can drive the agent
+```
+
+Each field falls back to its `GOOGLE_CHAT_ALLOW_ALL_USERS` / `GOOGLE_CHAT_ALLOWED_USERS` env var when unset.
+
+> ⚠️ **Deprecated:** driving Google Chat trust through the uniform `GATEWAY_ALLOW_ALL_USERS` / `GATEWAY_ALLOWED_USERS` env vars still works but logs a startup warning; it will become a startup error in a later phase. Migrate to `[googlechat]` (or `GOOGLE_CHAT_*` env vars).
 
 ## Features
 

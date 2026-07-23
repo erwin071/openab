@@ -38,14 +38,33 @@ helm install openab openab/openab \
   --set agents.opencode.enabled=true \
   --set agents.opencode.command=opencode \
   --set 'agents.opencode.args={acp}' \
-  --set agents.opencode.image=ghcr.io/openabdev/openab-opencode:latest \
   --set agents.opencode.discord.botToken="$DISCORD_BOT_TOKEN" \
   --set-string 'agents.opencode.discord.allowedChannels[0]=YOUR_CHANNEL_ID' \
   --set agents.opencode.workingDir=/home/node \
-  --set agents.opencode.pool.maxSessions=3
+  --set agents.opencode.pool.maxSessions=3 \
+  --set image.tag=beta
 ```
 
 > Set `agents.kiro.enabled=false` to disable the default Kiro agent.
+
+### Image Tag
+
+Use `--set image.tag=<version>` to set the image version globally.
+The chart auto-appends `-<agent>` to produce the final tag (see [image-tags.md](image-tags.md) for full details).
+
+| Tag | Resolves to | Description |
+|-----|-------------|-------------|
+| `beta` | `beta-opencode` | Floating beta channel (latest pre-release) |
+| `0.9.0-beta.2` | `0.9.0-beta.2-opencode` | Pinned to exact version |
+| `0.9` | `0.9-opencode` | Latest patch in minor (floating) |
+| `stable` | `stable-opencode` | Floating stable channel |
+
+To override a single agent's image instead of the global tag:
+```bash
+--set agents.opencode.image=ghcr.io/openabdev/openab:beta-opencode
+```
+
+> ⚠️ There is no `latest` tag. Use `beta` or `stable`, or pin to an exact version.
 
 ## Manual config.toml
 
@@ -173,6 +192,52 @@ kubectl rollout restart deployment/openab-opencode
 ```
 
 > **Important:** Do NOT set a custom `baseURL` or provider override for xAI. The built-in xAI provider handles routing correctly. A stale `~/.config/opencode/opencode.json` with `baseURL: "http://localhost:9090/v1"` (from xai-proxy setups) will break xAI — delete it if present.
+
+## Example: API Key Providers
+
+For providers that use API keys instead of OAuth (e.g. opencode-go, custom
+OpenAI-compatible endpoints), the config needs the full `provider` block with
+`options.apiKey`:
+
+### 1. Set the model and API key
+
+Create `opencode.json` in the working directory (`/home/node`). The key
+difference from OAuth providers is the `provider.options.apiKey` field:
+
+```bash
+kubectl exec -it deployment/openab-opencode -- bash -c 'cat > /home/node/opencode.json << EOF
+{
+  "provider": {
+    "opencode-go": {
+      "options": {
+        "baseURL": "https://opencode.ai/zen/go/v1",
+        "apiKey": "{env:OPENCODE_API_KEY}"
+      },
+      "models": {
+        "deepseek-v4-flash": {}
+      }
+    }
+  },
+  "model": "opencode-go/deepseek-v4-flash"
+}
+EOF'
+```
+
+> Inject `OPENCODE_API_KEY` via a Kubernetes Secret as an environment variable.
+>
+> Note: shell-style `${OPENCODE_API_KEY}` would also work in this specific
+> heredoc (bash expands it before writing), but only here. `{env:VAR}` is the
+> form that works everywhere.
+>
+> See the [opencode env var docs](https://opencode.ai/docs/config/#env-vars)
+> for the full `{env:VAR}` syntax and provider block schema.
+
+
+### 2. Restart to pick up config
+
+```bash
+kubectl rollout restart deployment/openab-opencode
+```
 
 ## Notes
 

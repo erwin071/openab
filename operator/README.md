@@ -1,83 +1,136 @@
-# oabctl — OAB Agent Provisioner for ECS
+# oabctl — OAB Agent Provisioner
 
-CLI tool that provisions and manages OpenAB agents on Amazon ECS Fargate.
+CLI tool that provisions and manages OpenAB agents on Amazon ECS Fargate (with Kubernetes support planned).
+
+> 📖 **Full usage guide** — installation, manifest schema, ingress/webhooks,
+> secrets, bootstrap, and the commands reference: **[docs/oabctl.md](../docs/oabctl.md)**
+
+## How It Works
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Developer Machine                                                       │
+│                                                                          │
+│  oabctl bootstrap ──► Creates: ECS Cluster, IAM Roles, S3, SG, Logs    │
+│                                                                          │
+│  oabctl create ─────► Wizard → config.toml + manifest.yaml (local)      │
+│       │                  │                                               │
+│       │                  └─► Secrets Manager: oab/{ns}/{name}            │
+│       │                                                                  │
+│  oabctl apply                                                            │
+│       │                                                                  │
+│       ├─► S3: Upload config.toml to artifacts/{ns}/{name}/              │
+│       ├─► ECS: Register Task Definition                                  │
+│       └─► ECS: Create/Update Service                                     │
+│                                                                          │
+│  oabctl exec/cp/sync ──► ecsctl library ──► ECS Exec (SSM)             │
+└──────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│  AWS Cloud                                                               │
+│                                                                          │
+│  ┌─────────────┐     ┌──────────────────────────────────────────┐       │
+│  │ S3 Bucket   │     │ ECS Cluster (oab)                        │       │
+│  │             │     │                                          │       │
+│  │ bootstrap/  │     │  ┌─────────────────────────────────┐    │       │
+│  │   state.json│     │  │ Fargate Task (agent)             │    │       │
+│  │             │     │  │                                  │    │       │
+│  │ manifests/  │     │  │  ┌────────────────────────────┐ │    │       │
+│  │   *.yaml    │     │  │  │ OpenAB Container           │ │    │       │
+│  │             │     │  │  │                            │ │    │       │
+│  │ artifacts/  │◄────┼──┼──│ 1. Download config.toml    │ │    │       │
+│  │   config.toml     │  │  │ 2. Resolve [secrets.refs]  │─┼────┼──►SM  │
+│  │             │     │  │  │ 3. Start agent             │ │    │       │
+│  └─────────────┘     │  │  └────────────────────────────┘ │    │       │
+│                       │  └─────────────────────────────────┘    │       │
+│  ┌──────────────┐    └──────────────────────────────────────────┘       │
+│  │ Secrets Mgr  │                                                        │
+│  │ oab/{ns}/{n} │    ┌───────────────┐                                  │
+│  │  BOT_TOKEN   │    │ CloudWatch    │                                  │
+│  │  STT_API_KEY │    │ /oab/agents   │                                  │
+│  └──────────────┘    └───────────────┘                                  │
+└─────────────────────────────────────────────────────────────────────────┘
+```
 
 ## Quick Start
 
 ```bash
-# Build
-cd operator && cargo build --release
+# 1. Bootstrap infrastructure (one-time)
+oabctl bootstrap
 
-# Deploy an agent
-oabctl apply -f examples/kiro-01.yaml
+# 2. Create an agent (generates config + manifest)
+oabctl create my-bot
 
-# List running agents
-oabctl get oabservice
+# 3. Review generated files, then deploy
+oabctl apply -f my-bot/manifest.yaml --wait
 
-# Delete an agent
-oabctl delete oabservice kiro-01 --cluster default --namespace prod
+# 4. Done! Agent is running.
+oabctl exec my-bot -- bash
 ```
 
-## Prerequisites
+See **[docs/oabctl.md](../docs/oabctl.md)** for installation instructions,
+the full manifest schema (including ingress/webhooks for Telegram and LINE),
+secrets formats, bootstrap details, IAM permission tables, and the complete
+commands reference.
 
-1. **AWS credentials** — IAM role/profile with permissions for ECS, SSM, S3
-2. **S3 bucket** — `oab-control-plane` (manifests + rendered config)
-3. **ECS cluster** — default cluster or specify with `--cluster`
-4. **VPC** — subnets + security groups for Fargate tasks
-5. **ECR image** — OAB container image pushed to ECR
-6. **SSM parameters** — bot tokens stored at `/oab/{namespace}/{name}/discord-token`
+## Library API
 
-## Manifest Schema
+The crate exposes a deliberately narrow manifest + apply facade for control
+planes that should not shell out to the CLI:
 
-```yaml
-apiVersion: oab.dev/v1
-kind: OABService
-metadata:
-  name: kiro-01
-  namespace: prod
-spec:
-  capacityProvider: FARGATE_SPOT   # FARGATE or FARGATE_SPOT
-  cpu: 256                         # vCPU units
-  memory: 512                      # MB
-  taskDefinition:
-    image: <ecr-image-uri>
-  bootstrapFrom: s3://...          # agent HOME archive (memory, state)
-  networking:
-    subnets: [subnet-xxx]
-    securityGroups: [sg-xxx]
-  secrets:
-    - name: DISCORD_TOKEN
-      valueFrom: /oab/prod/kiro-01/discord-token
-  config:
-    channels:
-      - type: discord
-    backend:
-      type: bedrock
-      model_id: anthropic.claude-sonnet-4-20250514
-      region: us-east-1
-    steering:
-      system_prompt: "..."
-    features:
-      stt: false
-      cronjob: true
+```rust,no_run
+use oabctl::{apply_manifests, ApplyOptions, OABServiceManifest};
+
+async fn deploy(
+    aws: &aws_config::SdkConfig,
+    manifest: OABServiceManifest,
+) -> Result<(), oabctl::ApplyError> {
+    let report = apply_manifests(
+        aws,
+        &[manifest],
+        &ApplyOptions::new("production-cluster").with_wait(true),
+    )
+    .await?;
+    for service in report.services {
+        println!("{}: {:?}", service.ecs_service_name, service.action);
+    }
+    Ok(())
+}
 ```
 
-## Commands
+Programmatic apply emits no progress to process-global stdout/stderr. Success
+returns per-service actions, webhook URLs, and warnings; reconciliation errors
+identify the failed service and include the report completed before the failure.
+Both CLI and programmatic apply verify that the target cluster exists and is
+`ACTIVE` before mutation, so the caller identity requires
+`ecs:DescribeClusters`. This ECS action does not support resource-level
+permissions; its IAM statement must use `Resource: "*"`.
+The library never reads `~/.oabctl/config.toml`: set
+`with_control_plane_bucket(...)` explicitly when needed, otherwise bucket
+resolution uses `OAB_CONTROL_PLANE_BUCKET` and then the caller's AWS account.
+For `aws-sm://<secret-id>#<json-key>`, a non-ARN `<secret-id>` requires the
+caller to have `secretsmanager:DescribeSecret`; full-ARN shorthand does not
+need that lookup.
 
-| Command | Description |
-|---------|-------------|
-| `oabctl apply -f <file\|dir>` | Create or update agents from manifests |
-| `oabctl get oabservice [name]` | List agents and their ECS status |
-| `oabctl delete oabservice <name>` | Teardown agent (ECS + S3 cleanup) |
+## Source Layout
 
-## How It Works
+```
+operator/
+├── src/
+│   ├── main.rs        # Thin binary entrypoint (`oabctl::run_cli()`)
+│   ├── cli.rs         # Private CLI definitions and subcommand dispatch
+│   ├── manifest.rs    # Publicly re-exported manifest model + validation
+│   ├── apply.rs       # apply: ECS task def registration, service create/update
+│   ├── bootstrap.rs   # bootstrap: cluster/IAM/S3/SG/log-group provisioning
+│   ├── ingress.rs     # ingress: Cloud Map + VPC Link + API Gateway reconciliation
+│   ├── secrets.rs     # spec.secrets value resolution (ECS-native + aws-sm:// shorthand)
+│   ├── create.rs      # create: interactive wizard
+│   ├── get.rs         # get: list/describe agents
+│   └── delete.rs      # delete: teardown
+└── schema/
+    └── oabservice-v2.json  # JSON Schema for IDE validation
+```
 
-1. `oabctl apply` validates the manifest, renders `config.toml` from `spec.config`, uploads to S3 at an immutable path (`config/{ns}/{name}/{generation}/`), registers an ECS task definition, and creates/updates the ECS service.
+## JSON Schema
 
-2. ECS maintains the desired state — restarts failed tasks, handles rolling deployments. No separate controller needed.
-
-3. On task startup, `entrypoint.sh` downloads the bootstrap archive and rendered config from S3, then starts OpenAB.
-
-## Architecture
-
-See [ADR: ECS Control Plane](../docs/adr/ecs-control-plane.md) for the full design.
+[`schema/oabservice-v2.json`](schema/oabservice-v2.json) — supports both OABService and OABFleet for IDE validation.

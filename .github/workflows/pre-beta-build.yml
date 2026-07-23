@@ -1,0 +1,330 @@
+name: Pre-Beta Build
+
+on:
+  schedule:
+    - cron: '0 * * * *'      # hourly; gate job skips the build if no commit in the last ~70min
+  workflow_dispatch:
+    inputs:
+      agents:
+        description: 'Agents to build (comma-separated, or "all")'
+        required: false
+        type: string
+        default: 'all'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  ALL_AGENTS: 'kiro,claude,codex,copilot,cursor,devin,gemini,grok,hermes,kimi,mimocode,opencode,antigravity,pi,native,agentcore'
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+    steps:
+      - name: Skip scheduled run when no recent commits
+        uses: actions/github-script@v7
+        id: check
+        with:
+          script: |
+            // Manual runs always build.
+            if (context.eventName === 'workflow_dispatch') {
+              core.setOutput('should_run', 'true');
+              return;
+            }
+            // Scheduled run: build only if main got a commit in the last ~70min.
+            const since = new Date(Date.now() - 70 * 60 * 1000).toISOString();
+            const { data: commits } = await github.rest.repos.listCommits({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.payload.repository?.default_branch || 'main',
+              since,
+              per_page: 1,
+            });
+            const run = commits.length > 0;
+            core.info(`commits since ${since}: ${commits.length} -> should_run=${run}`);
+            core.setOutput('should_run', run ? 'true' : 'false');
+
+  matrix:
+    needs: gate
+    if: needs.gate.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      agents: ${{ steps.resolve.outputs.agents }}
+    steps:
+      - name: Resolve agent matrix
+        id: resolve
+        env:
+          INPUT_AGENTS: ${{ inputs.agents }}
+        run: |
+          if [ "$INPUT_AGENTS" = "all" ] || [ -z "$INPUT_AGENTS" ]; then
+            AGENTS="$ALL_AGENTS"
+          else
+            AGENTS="$INPUT_AGENTS"
+          fi
+          JSON=$(echo "$AGENTS" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | jq -R . | jq -sc .)
+          echo "agents=${JSON}" >> "$GITHUB_OUTPUT"
+          echo "Building: $AGENTS"
+
+  # ---------------------------------------------------------------------------
+  # Compile openab (and openab-agent, agy-acp) once per architecture.
+  # Uploads pre-built binaries as artifacts for the packaging jobs.
+  # ---------------------------------------------------------------------------
+  compile:
+    needs: [gate, matrix]
+    if: needs.gate.outputs.should_run == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - { os: linux/amd64, runner: ubuntu-latest, arch: amd64 }
+          - { os: linux/arm64, runner: ubuntu-24.04-arm, arch: arm64 }
+    runs-on: ${{ matrix.platform.runner }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable (2026-07-13)
+
+      - name: Cache cargo registry & target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: compile-${{ matrix.platform.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            compile-${{ matrix.platform.arch }}-
+
+      - name: Build openab
+        run: cargo build --release --features unified
+
+      - name: Build openab-agent
+        run: cd openab-agent && printf '\n[workspace]\n' >> Cargo.toml && cargo build --release
+
+      # agy-acp/Cargo.toml already declares [workspace] permanently, so no runtime
+      # injection is needed here — unlike openab-agent above. Appending it
+      # unconditionally would create a duplicate [workspace] table and break the build.
+      - name: Build agy-acp
+        run: cd agy-acp && cargo build --release
+
+      - name: Collect binaries
+        run: |
+          mkdir -p bins
+          cp target/release/openab bins/
+          cp openab-agent/target/release/openab-agent bins/
+          cp agy-acp/target/release/agy-acp bins/
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: openab-bins-${{ matrix.platform.arch }}
+          path: bins/
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Package: build lightweight Docker images (no Rust compilation).
+  # Downloads pre-built binaries and uses Dockerfile.package.
+  # ---------------------------------------------------------------------------
+  build:
+    needs: [matrix, compile]
+    strategy:
+      fail-fast: false
+      matrix:
+        agent: ${{ fromJson(needs.matrix.outputs.agents) }}
+        platform:
+          - { os: linux/amd64, runner: ubuntu-latest, arch: amd64 }
+          - { os: linux/arm64, runner: ubuntu-24.04-arm, arch: arm64 }
+    runs-on: ${{ matrix.platform.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download pre-built binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: openab-bins-${{ matrix.platform.arch }}
+          path: bin
+
+      - name: Make binaries executable
+        run: chmod +x bin/*
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.package
+          target: ${{ matrix.agent }}
+          build-contexts: bins=bin
+          platforms: ${{ matrix.platform.os }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: |
+            type=gha,scope=pre-beta-pkg-${{ matrix.agent }}-${{ matrix.platform.arch }}
+          cache-to: type=gha,scope=pre-beta-pkg-${{ matrix.agent }}-${{ matrix.platform.arch }},mode=max
+
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.agent }}-${{ matrix.platform.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  tag:
+    needs: [matrix, build]
+    strategy:
+      matrix:
+        agent: ${{ fromJson(needs.matrix.outputs.agents) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-${{ matrix.agent }}-*
+          merge-multiple: true
+
+      - name: Create manifest and tag
+        env:
+          AGENT: ${{ matrix.agent }}
+        run: |
+          IMAGE="${REGISTRY}/${IMAGE_NAME}"
+          SHORT_SHA=$(echo "$GITHUB_SHA" | head -c 7)
+
+          # Map "default" target name to "kiro" for tagging
+          if [ "$AGENT" = "default" ]; then
+            AGENT="kiro"
+          fi
+
+          DIGESTS=$(printf "${IMAGE}@sha256:%s " $(ls /tmp/digests/))
+
+          docker buildx imagetools create \
+            -t "${IMAGE}:pre-beta-${AGENT}" \
+            -t "${IMAGE}:${SHORT_SHA}-${AGENT}" \
+            ${DIGESTS}
+
+          echo "### 📦 \`${IMAGE}:pre-beta-${AGENT}\`" >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # oabctl pre-beta: builds the operator CLI for all supported platforms and
+  # publishes them to a rolling `oabctl-pre-beta` GitHub Release, so the
+  # latest pre-beta oabctl is always downloadable at a fixed URL instead of
+  # requiring a local build — mirrors the `pre-beta-<agent>` rolling Docker
+  # tags above, but as a rolling release since oabctl has no image to push.
+  # ---------------------------------------------------------------------------
+  oabctl-pre-beta:
+    needs: gate
+    if: needs.gate.outputs.should_run == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [linux-x86_64, linux-aarch64, macos-arm64]
+    runs-on: ${{ matrix.target == 'macos-arm64' && 'macos-latest' || 'ubuntu-latest' }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable (2026-07-13)
+        with:
+          targets: ${{ matrix.target == 'linux-aarch64' && 'aarch64-unknown-linux-gnu' || '' }}
+
+      - name: Install cross-compilation tools
+        if: matrix.target == 'linux-aarch64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build oabctl
+        working-directory: operator
+        run: |
+          if [ "${{ matrix.target }}" = "linux-aarch64" ]; then
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+            cargo build --release --target aarch64-unknown-linux-gnu
+            cp target/aarch64-unknown-linux-gnu/release/oabctl .
+          else
+            cargo build --release
+            cp target/release/oabctl .
+          fi
+
+      - name: Package
+        working-directory: operator
+        run: tar czf oabctl-pre-beta-${{ matrix.target }}.tar.gz oabctl
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: oabctl-pre-beta-${{ matrix.target }}
+          path: operator/oabctl-pre-beta-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  oabctl-pre-beta-publish:
+    needs: [gate, oabctl-pre-beta]
+    if: needs.gate.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: oabctl-pre-beta-*
+          merge-multiple: true
+
+      - name: Recreate rolling pre-beta release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="oabctl-pre-beta"
+          SHORT_SHA=$(echo "${{ github.sha }}" | head -c 7)
+          # Rolling release: delete any previous one so the tag always points
+          # at the latest build (mirrors the rolling `pre-beta-<agent>` image
+          # tags — not a versioned release).
+          gh release delete "$TAG" --repo "${{ github.repository }}" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "oabctl pre-beta (${SHORT_SHA})" \
+            --notes "Rolling pre-beta build of \`oabctl\` from \`main\`@${SHORT_SHA}. Overwritten on every pre-beta build — not a stable version, matches the \`pre-beta-*\` image tags. For a pinned version, use the \`openab-<version>\` release attached to a real openab release instead." \
+            --prerelease \
+            artifacts/*.tar.gz
+
