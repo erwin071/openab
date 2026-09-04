@@ -178,12 +178,12 @@ jobs:
           assert_line 'ARG DEVIN_VERSION=3000.2.17' Dockerfile.devin Dockerfile.package Dockerfile.unified
           assert_line 'ARG DEVIN_SHA256_AMD64=f0e1e9363afc6ee68c4ef87bab4aeb7ff5cc08a5fa838350ef3ceefdbb2a2be2' Dockerfile.devin Dockerfile.package Dockerfile.unified
           assert_line 'ARG DEVIN_SHA256_ARM64=116dc71ef085a922bc3ff0ea0377d4b26c529a431d58246e36572913e2d25624' Dockerfile.devin Dockerfile.package Dockerfile.unified
-          assert_line 'ENV AGY_VERSION=1.1.13' Dockerfile.antigravity Dockerfile.unified Dockerfile.final Dockerfile.ci
-          assert_line 'ARG AGY_VERSION=1.1.13' Dockerfile.package
+          assert_line 'ENV AGY_VERSION=1.1.26' Dockerfile.antigravity Dockerfile.unified Dockerfile.final Dockerfile.ci
+          assert_line 'ARG AGY_VERSION=1.1.26' Dockerfile.package
           assert_line 'ENV AGY_VERSION="${AGY_VERSION}"' Dockerfile.package
           assert_line 'LABEL dev.openab.agy.version="${AGY_VERSION}"' Dockerfile.package
-          assert_line 'ARG AGY_SHA256_AMD64=edc7c32b5ab4fc2e4da03381fee83ed566dea6b56b56f9329cd13cd77947a1d9' Dockerfile.antigravity Dockerfile.package Dockerfile.unified Dockerfile.final Dockerfile.ci
-          assert_line 'ARG AGY_SHA256_ARM64=a9fdd2a386770c27dbf784436bd4de70d4d4901c832d5ec6abf27758d5c370f8' Dockerfile.antigravity Dockerfile.package Dockerfile.unified Dockerfile.final Dockerfile.ci
+          assert_line 'ARG AGY_SHA256_AMD64=c47c0726266b3513660b7094bceceecbd03d8ae907786aa269c507ceb7e4ee54' Dockerfile.antigravity Dockerfile.package Dockerfile.unified Dockerfile.final Dockerfile.ci
+          assert_line 'ARG AGY_SHA256_ARM64=f595d2f1ae23001afffab9cb9012d054f0e8a02a1e848537f73239ae8d3fbd6d' Dockerfile.antigravity Dockerfile.package Dockerfile.unified Dockerfile.final Dockerfile.ci
 
           # Nightly checksum relaxation must be explicit and limited to the two
           # TLS-only vendor paths. These substring checks intentionally ignore

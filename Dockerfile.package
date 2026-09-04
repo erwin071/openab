@@ -329,11 +329,11 @@ CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
 # =============================================================================
 FROM base-debian AS antigravity
 # One overridable pin drives the download and all persisted image metadata.
-ARG AGY_VERSION=1.1.13
+ARG AGY_VERSION=1.1.26
 ENV AGY_VERSION="${AGY_VERSION}"
 LABEL dev.openab.agy.version="${AGY_VERSION}"
-ARG AGY_SHA256_AMD64=edc7c32b5ab4fc2e4da03381fee83ed566dea6b56b56f9329cd13cd77947a1d9
-ARG AGY_SHA256_ARM64=a9fdd2a386770c27dbf784436bd4de70d4d4901c832d5ec6abf27758d5c370f8
+ARG AGY_SHA256_AMD64=c47c0726266b3513660b7094bceceecbd03d8ae907786aa269c507ceb7e4ee54
+ARG AGY_SHA256_ARM64=f595d2f1ae23001afffab9cb9012d054f0e8a02a1e848537f73239ae8d3fbd6d
 # Explicit opt-in for the nightly TLS-only path. Empty SHA values fail closed
 # for every other caller, including release and pre-beta builds.
 ARG ALLOW_UNVERIFIED_NIGHTLY_DOWNLOADS=false
