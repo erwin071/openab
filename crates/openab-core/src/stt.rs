@@ -1,7 +1,7 @@
 use crate::adapter::{ChannelRef, ChatAdapter, MessageRef};
 use crate::config::SttConfig;
 use reqwest::multipart;
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use tracing::{debug, error, warn};
 
 /// Outcome of attempting STT on a single audio attachment.
@@ -71,6 +71,10 @@ pub async fn post_echo(
 }
 
 /// Transcribe audio bytes via an OpenAI-compatible `/audio/transcriptions` endpoint.
+///
+/// Service endpoint updates can briefly invalidate an existing connection. Retry
+/// only transient transport and upstream errors, recreating the multipart body
+/// for each attempt because request bodies are consumed on send.
 pub async fn transcribe(
     client: &reqwest::Client,
     cfg: &SttConfig,
@@ -78,41 +82,57 @@ pub async fn transcribe(
     filename: String,
     mime_type: &str,
 ) -> Option<String> {
+    const MAX_ATTEMPTS: usize = 3;
+    const RETRY_DELAY_MS: u64 = 300;
+
     let url = format!(
         "{}/audio/transcriptions",
         cfg.base_url.trim_end_matches('/')
     );
+    let mut attempt = 1;
 
-    let file_part = multipart::Part::bytes(audio_bytes)
-        .file_name(filename)
-        .mime_str(mime_type)
-        .ok()?;
+    let resp = loop {
+        let file_part = multipart::Part::bytes(audio_bytes.clone())
+            .file_name(filename.clone())
+            .mime_str(mime_type)
+            .ok()?;
+        let form = multipart::Form::new()
+            .part("file", file_part)
+            .text("model", cfg.model.clone())
+            .text("response_format", "json");
 
-    let form = multipart::Form::new()
-        .part("file", file_part)
-        .text("model", cfg.model.clone())
-        .text("response_format", "json");
-
-    let resp = match client
-        .post(&url)
-        .bearer_auth(&cfg.api_key)
-        .multipart(form)
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            error!(error = %e, "STT request failed");
-            return None;
+        match client
+            .post(&url)
+            .bearer_auth(&cfg.api_key)
+            .multipart(form)
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => break response,
+            Ok(response) => {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                let retryable = status.is_server_error()
+                    || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+                if retryable && attempt < MAX_ATTEMPTS {
+                    warn!(attempt, %status, "transient STT API error; retrying");
+                } else {
+                    error!(attempt, %status, body = %body, "STT API error");
+                    return None;
+                }
+            }
+            Err(e) => {
+                if attempt >= MAX_ATTEMPTS {
+                    error!(attempt, error = %e, debug_error = ?e, "STT request failed after retries");
+                    return None;
+                }
+                warn!(attempt, error = %e, "STT transport error; retrying");
+            }
         }
-    };
 
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        error!(status = %status, body = %body, "STT API error");
-        return None;
-    }
+        tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS * attempt as u64)).await;
+        attempt += 1;
+    };
 
     let json: serde_json::Value = match resp.json().await {
         Ok(v) => v,
