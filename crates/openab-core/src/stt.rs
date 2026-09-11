@@ -84,6 +84,7 @@ pub async fn transcribe(
 ) -> Option<String> {
     const MAX_ATTEMPTS: usize = 3;
     const RETRY_DELAY_MS: u64 = 300;
+    const STT_REQUEST_TIMEOUT_SECS: u64 = 90;
 
     let url = format!(
         "{}/audio/transcriptions",
@@ -103,6 +104,7 @@ pub async fn transcribe(
 
         match client
             .post(&url)
+            .timeout(Duration::from_secs(STT_REQUEST_TIMEOUT_SECS))
             .bearer_auth(&cfg.api_key)
             .multipart(form)
             .send()
