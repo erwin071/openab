@@ -85,6 +85,35 @@ fn expand_env(val: &str) -> String {
 }
 use tokio::time::Instant;
 
+fn configured_mcp_servers() -> Result<Vec<Value>> {
+    let url = std::env::var("LINUX_MCP_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let token = std::env::var("LINUX_MCP_TOKEN")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+
+    match (url, token) {
+        (None, None) => Ok(Vec::new()),
+        (Some(url), Some(token)) => {
+            let name = std::env::var("LINUX_MCP_NAME")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "linux-instance".to_string());
+            Ok(vec![json!({
+                "type": "http",
+                "name": name,
+                "url": url,
+                "headers": [{
+                    "name": "Authorization",
+                    "value": format!("Bearer {token}"),
+                }],
+            })])
+        }
+        _ => Err(anyhow!("LINUX_MCP_URL and LINUX_MCP_TOKEN must be set together")),
+    }
+}
+
 /// A content block for the ACP prompt — either text or image.
 #[derive(Debug, Clone)]
 pub enum ContentBlock {
@@ -580,7 +609,10 @@ impl AcpConnection {
 
     pub async fn session_new(&mut self, cwd: &str) -> Result<String> {
         let resp = self
-            .send_request("session/new", Some(json!({"cwd": cwd, "mcpServers": []})))
+            .send_request(
+                "session/new",
+                Some(json!({"cwd": cwd, "mcpServers": configured_mcp_servers()?})),
+            )
             .await?;
 
         let session_id = resp
@@ -797,7 +829,11 @@ impl AcpConnection {
         let resp = self
             .send_request(
                 "session/load",
-                Some(json!({"sessionId": session_id, "cwd": cwd, "mcpServers": []})),
+                Some(json!({
+                    "sessionId": session_id,
+                    "cwd": cwd,
+                    "mcpServers": configured_mcp_servers()?,
+                })),
             )
             .await?;
         // Accept any non-error response as success
