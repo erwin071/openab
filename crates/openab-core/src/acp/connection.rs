@@ -86,6 +86,12 @@ fn expand_env(val: &str) -> String {
 use tokio::time::Instant;
 
 fn configured_mcp_servers() -> Result<Vec<Value>> {
+    if let Ok(config) = std::env::var("OPENAB_MCP_SERVERS") {
+        if !config.trim().is_empty() {
+            return parse_mcp_servers_config(&config);
+        }
+    }
+
     let url = std::env::var("LINUX_MCP_URL")
         .ok()
         .filter(|value| !value.trim().is_empty());
@@ -112,6 +118,56 @@ fn configured_mcp_servers() -> Result<Vec<Value>> {
         }
         _ => Err(anyhow!("LINUX_MCP_URL and LINUX_MCP_TOKEN must be set together")),
     }
+}
+
+/// Parse the optional multi-server HTTP MCP configuration.
+///
+/// The configuration is a JSON array so deployments can add another server by
+/// changing environment/configuration only. Secrets are referenced by the
+/// environment variable name in `token_env`, never embedded in the JSON.
+fn parse_mcp_servers_config(config: &str) -> Result<Vec<Value>> {
+    let entries: Vec<Value> = serde_json::from_str(config)
+        .map_err(|err| anyhow!("OPENAB_MCP_SERVERS must be a JSON array: {err}"))?;
+    let mut names = std::collections::HashSet::new();
+    let mut servers = Vec::with_capacity(entries.len());
+
+    for (index, entry) in entries.iter().enumerate() {
+        let object = entry
+            .as_object()
+            .ok_or_else(|| anyhow!("OPENAB_MCP_SERVERS entry {index} must be an object"))?;
+        let name = object
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow!("OPENAB_MCP_SERVERS entry {index} requires a non-empty name"))?;
+        if !names.insert(name.to_string()) {
+            return Err(anyhow!("duplicate MCP server name: {name}"));
+        }
+        let url = object
+            .get("url")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow!("OPENAB_MCP_SERVERS entry {name} requires a non-empty url"))?;
+
+        let mut server = json!({
+            "type": "http",
+            "name": name,
+            "url": url,
+        });
+        if let Some(token_env) = object.get("token_env").and_then(Value::as_str) {
+            let token = std::env::var(token_env)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| anyhow!("MCP server {name} token_env {token_env} is not set"))?;
+            server["headers"] = json!([{
+                "name": "Authorization",
+                "value": format!("Bearer {token}"),
+            }]);
+        }
+        servers.push(server);
+    }
+
+    Ok(servers)
 }
 
 /// A content block for the ACP prompt — either text or image.
@@ -888,7 +944,7 @@ impl Drop for AcpConnection {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_agent_env, build_permission_response, pick_best_option};
+    use super::{build_agent_env, build_permission_response, parse_mcp_servers_config, pick_best_option};
     use serde_json::json;
 
     #[test]
@@ -1020,6 +1076,25 @@ mod tests {
 
         assert!(!result.contains_key("OAB_TEST_NONEXISTENT_VAR_12345"));
         assert!(inherited.is_empty());
+    }
+    #[test]
+    fn parses_multiple_http_mcp_servers() {
+        std::env::set_var("OAB_TEST_MCP_TOKEN", "test-token");
+        let config = json!([{ "name": "linux-instance", "url": "http://linux/mcp", "token_env": "OAB_TEST_MCP_TOKEN" }, { "name": "hotel-price-checker", "url": "http://hotel/mcp" }]).to_string();
+        let servers = parse_mcp_servers_config(&config).unwrap();
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers[0]["name"], "linux-instance");
+        assert_eq!(servers[0]["headers"][0]["value"], "Bearer test-token");
+        assert_eq!(servers[1]["name"], "hotel-price-checker");
+        assert!(servers[1].get("headers").is_none());
+        std::env::remove_var("OAB_TEST_MCP_TOKEN");
+    }
+
+    #[test]
+    fn rejects_duplicate_mcp_server_names() {
+        let config = json!([{ "name": "same", "url": "http://one" }, { "name": "same", "url": "http://two" }]).to_string();
+        let error = parse_mcp_servers_config(&config).unwrap_err();
+        assert!(error.to_string().contains("duplicate MCP server name"));
     }
 }
 
